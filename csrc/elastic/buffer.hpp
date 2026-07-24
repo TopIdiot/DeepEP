@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -45,6 +46,16 @@ class ElasticBuffer {
 
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
+
+    struct DispatchRecvBufferSlot {
+        torch::Tensor recv_x;
+        std::optional<torch::Tensor> recv_sf;
+    };
+
+    // Reusable dispatch outputs are opt-in per call.  Rings are separated by
+    // x/sf dtype and SF layout so FP8 forward and BF16 backward never alias.
+    // The caller supplies the slot index and an overwrite fence for that slot.
+    mutable std::map<int64_t, std::vector<DispatchRecvBufferSlot>> dispatch_recv_buffer_rings;
 
     // Timeout settings
     int num_cpu_timeout_secs;
@@ -723,7 +734,8 @@ public:
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync,
              const bool& do_expand, const bool& do_zero_padding,
-             const bool& use_tma_aligned_col_major_sf) const {
+             const bool& use_tma_aligned_col_major_sf,
+             const std::optional<int>& dispatch_recv_buffer_slot) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -799,6 +811,13 @@ public:
         // Stream control
         // All new tensor allocations should happen after this
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
+
+        const bool reuse_dispatch_recv_buffer = dispatch_recv_buffer_slot.has_value();
+        if (reuse_dispatch_recv_buffer) {
+            EP_HOST_ASSERT(dispatch_recv_buffer_slot.value() >= 0);
+            EP_HOST_ASSERT(not do_cpu_sync and not do_expand and
+                           "Reusable dispatch recv buffers require a device-only, non-expanded dispatch");
+        }
 
         // The number of received tokens per expert
         // This is useful for expanding mode
@@ -1073,8 +1092,40 @@ public:
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
-        auto recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+        // Wait only after the communication body has completed, immediately
+        // before storage for the chosen slot may be replaced or overwritten.
+        if (reuse_dispatch_recv_buffer)
+            stream_control_before_epilogue(previous_event_before_epilogue);
+
+        auto recv_x = torch::Tensor();
         auto recv_sf = std::optional<torch::Tensor>();
+        DispatchRecvBufferSlot* reusable_slot = nullptr;
+        if (reuse_dispatch_recv_buffer) {
+            int64_t ring_key = static_cast<int64_t>(x.scalar_type());
+            if (sf.has_value())
+                ring_key |= (static_cast<int64_t>(sf->scalar_type()) + 1) << 8;
+            if (use_tma_aligned_col_major_sf)
+                ring_key |= static_cast<int64_t>(1) << 16;
+
+            auto& ring = dispatch_recv_buffer_rings[ring_key];
+            const auto slot_idx = static_cast<size_t>(dispatch_recv_buffer_slot.value());
+            if (ring.size() <= slot_idx)
+                ring.resize(slot_idx + 1);
+            reusable_slot = &ring[slot_idx];
+
+            const bool must_replace =
+                not reusable_slot->recv_x.defined() or
+                reusable_slot->recv_x.scalar_type() != x.scalar_type() or
+                reusable_slot->recv_x.device() != x.device() or
+                reusable_slot->recv_x.size(1) != hidden or
+                reusable_slot->recv_x.size(0) < num_allocated_tokens or
+                not reusable_slot->recv_x.is_contiguous();
+            if (must_replace)
+                reusable_slot->recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+            recv_x = reusable_slot->recv_x.narrow(0, 0, num_allocated_tokens).detach();
+        } else {
+            recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+        }
         auto recv_topk_idx = std::optional<torch::Tensor>();
         auto recv_topk_weights = std::optional<torch::Tensor>();
         auto recv_src_metadata = cached_mode ?
@@ -1094,9 +1145,34 @@ public:
                 // TMA-aligned layout for the next GEMM input
                 recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_allocated_tokens, kNumAlignedSFPacks);
             }
-            recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
-                                           {recv_sf_token_stride, recv_sf_hidden_stride},
-                                           sf->options());
+            if (reuse_dispatch_recv_buffer) {
+                EP_HOST_ASSERT(reusable_slot != nullptr);
+                const bool must_replace =
+                    not reusable_slot->recv_sf.has_value() or
+                    reusable_slot->recv_sf->scalar_type() != sf->scalar_type() or
+                    reusable_slot->recv_sf->device() != sf->device() or
+                    reusable_slot->recv_sf->size(1) != num_sf_packs or
+                    reusable_slot->recv_sf->size(0) < num_allocated_tokens or
+                    reusable_slot->recv_sf->stride(0) != recv_sf_token_stride or
+                    (use_tma_aligned_col_major_sf
+                         ? reusable_slot->recv_sf->stride(1) < recv_sf_hidden_stride
+                         : reusable_slot->recv_sf->stride(1) != recv_sf_hidden_stride);
+                if (must_replace) {
+                    reusable_slot->recv_sf = torch::empty_strided(
+                        {num_allocated_tokens, num_sf_packs},
+                        {recv_sf_token_stride, recv_sf_hidden_stride},
+                        sf->options());
+                }
+                recv_sf_token_stride = reusable_slot->recv_sf->stride(0);
+                recv_sf_hidden_stride = reusable_slot->recv_sf->stride(1);
+                recv_sf = reusable_slot->recv_sf->as_strided(
+                    {num_allocated_tokens, num_sf_packs},
+                    {recv_sf_token_stride, recv_sf_hidden_stride}).detach();
+            } else {
+                recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
+                                               {recv_sf_token_stride, recv_sf_hidden_stride},
+                                               sf->options());
+            }
             recv_sf_ptr = recv_sf->data_ptr();
         }
         if (not do_expand) {
@@ -1123,7 +1199,8 @@ public:
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
         // Launch copy kernels with full SMs
-        stream_control_before_epilogue(previous_event_before_epilogue);
+        if (not reuse_dispatch_recv_buffer)
+            stream_control_before_epilogue(previous_event_before_epilogue);
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
@@ -1148,7 +1225,14 @@ public:
         // Stream control
         const auto event = stream_control_epilogue(
             {x, sf, topk_idx, topk_weights,
-             recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+             // Reusable recv storage remains owned by this ElasticBuffer and
+             // is protected by the caller's per-slot overwrite fence.  Do not
+             // also hand its lifetime to the caching allocator via
+             // record_stream; that is both redundant and the behavior this
+             // bounded ring is intended to avoid.
+             reuse_dispatch_recv_buffer ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(recv_x),
+             reuse_dispatch_recv_buffer ? std::optional<torch::Tensor>() : recv_sf,
+             recv_topk_idx, recv_topk_weights,
              cumulative_local_expert_recv_stats,
              copied_topk_idx,
              psum_num_recv_tokens_per_scaleup_rank,
