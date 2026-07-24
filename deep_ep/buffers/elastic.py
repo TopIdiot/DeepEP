@@ -887,7 +887,8 @@ class ElasticBuffer:
                  do_expand: bool = False,
                  do_zero_padding: bool = False,
                  use_tma_aligned_col_major_sf: bool = False,
-                 dispatch_recv_buffer_slot: Optional[int] = None) \
+                 dispatch_recv_buffer_slot: Optional[int] = None,
+                 caller_managed_dispatch_recv_lifetime: bool = False) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -933,6 +934,9 @@ class ElasticBuffer:
             dispatch_recv_buffer_slot: optional caller-managed receive-buffer
                 slot. Requires ``set_dispatch_recv_buffer_reuse`` and a
                 device-only, non-expanded dispatch.
+            caller_managed_dispatch_recv_lifetime: skip DeepEP's ``record_stream``
+                calls for ``recv_x`` and its scale tensor. The caller must keep
+                both tensors alive and record every stream that reads them.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
@@ -1017,7 +1021,8 @@ class ElasticBuffer:
                                         do_handle_copy, do_cpu_sync, do_expand,
                                         do_zero_padding,
                                         use_tma_aligned_col_major_sf,
-                                        dispatch_recv_buffer_slot)
+                                        dispatch_recv_buffer_slot,
+                                        caller_managed_dispatch_recv_lifetime)
 
         # Create handle
         is_cached_dispatch = handle is not None

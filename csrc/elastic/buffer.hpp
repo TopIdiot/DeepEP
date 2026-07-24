@@ -735,7 +735,8 @@ public:
              const bool& do_handle_copy, const bool& do_cpu_sync,
              const bool& do_expand, const bool& do_zero_padding,
              const bool& use_tma_aligned_col_major_sf,
-             const std::optional<int>& dispatch_recv_buffer_slot) const {
+             const std::optional<int>& dispatch_recv_buffer_slot,
+             const bool& caller_managed_dispatch_recv_lifetime) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -813,6 +814,8 @@ public:
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
 
         const bool reuse_dispatch_recv_buffer = dispatch_recv_buffer_slot.has_value();
+        EP_HOST_ASSERT(not (reuse_dispatch_recv_buffer and caller_managed_dispatch_recv_lifetime) and
+                       "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive");
         if (reuse_dispatch_recv_buffer) {
             EP_HOST_ASSERT(dispatch_recv_buffer_slot.value() >= 0);
             EP_HOST_ASSERT(not do_cpu_sync and not do_expand and
@@ -1225,13 +1228,14 @@ public:
         // Stream control
         const auto event = stream_control_epilogue(
             {x, sf, topk_idx, topk_weights,
-             // Reusable recv storage remains owned by this ElasticBuffer and
-             // is protected by the caller's per-slot overwrite fence.  Do not
-             // also hand its lifetime to the caching allocator via
-             // record_stream; that is both redundant and the behavior this
-             // bounded ring is intended to avoid.
-             reuse_dispatch_recv_buffer ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(recv_x),
-             reuse_dispatch_recv_buffer ? std::optional<torch::Tensor>() : recv_sf,
+             // Reusable storage is protected by the caller's slot fence;
+             // caller-managed fresh storage is explicitly recorded on its
+             // final-reader stream. In either case DeepEP must not add the
+             // broader compute-stream lifetime below.
+             (reuse_dispatch_recv_buffer or caller_managed_dispatch_recv_lifetime)
+                 ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(recv_x),
+             (reuse_dispatch_recv_buffer or caller_managed_dispatch_recv_lifetime)
+                 ? std::optional<torch::Tensor>() : recv_sf,
              recv_topk_idx, recv_topk_weights,
              cumulative_local_expert_recv_stats,
              copied_topk_idx,
