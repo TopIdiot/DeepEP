@@ -361,6 +361,10 @@ class ElasticBuffer:
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
 
+        # Zero keeps the upstream allocation behavior.  A caller that owns the
+        # recv_x consumption fences may opt into a bounded reusable ring.
+        self._dispatch_recv_buffer_reuse_slots = 0
+
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
         group.barrier()
@@ -545,6 +549,18 @@ class ElasticBuffer:
         """
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
+
+    def set_dispatch_recv_buffer_reuse(self, num_slots: int) -> None:
+        """Enable caller-managed dispatch receive-buffer slots.
+
+        Every dispatch using a slot that was used before must pass a
+        ``previous_event_before_epilogue`` covering the previous output's last
+        read.  Slot selection is explicit so callers can keep independent
+        rings for different lifetimes while the C++ runtime separates dtype
+        and scale-factor layouts.
+        """
+        assert num_slots >= 0
+        self._dispatch_recv_buffer_reuse_slots = num_slots
 
     def get_physical_domain_size(self) -> Tuple[int, int]:
         """
@@ -870,7 +886,9 @@ class ElasticBuffer:
                  do_cpu_sync: Optional[bool] = None,
                  do_expand: bool = False,
                  do_zero_padding: bool = False,
-                 use_tma_aligned_col_major_sf: bool = False) \
+                 use_tma_aligned_col_major_sf: bool = False,
+                 dispatch_recv_buffer_slot: Optional[int] = None,
+                 caller_managed_dispatch_recv_lifetime: bool = False) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -913,6 +931,14 @@ class ElasticBuffer:
             do_zero_padding: whether to zero out the alignment padding slots in the expanded output.
                 Only valid when `do_expand` is True. Ensures alignment gaps between experts are zeroed.
             use_tma_aligned_col_major_sf: whether to use TMA-aligned column-major layout for scale factors.
+            dispatch_recv_buffer_slot: optional caller-managed receive-buffer
+                slot. Requires ``set_dispatch_recv_buffer_reuse`` and a
+                device-only, non-expanded dispatch.
+            caller_managed_dispatch_recv_lifetime: skip DeepEP's ``record_stream``
+                calls for ``recv_x`` and its scale tensor. The caller must keep
+                both tensors alive and record every stream that reads them.
+                Asynchronous use requires ``allocate_on_comm_stream=True`` so
+                the communication producer remains the allocation owner.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
@@ -959,6 +985,14 @@ class ElasticBuffer:
         num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
+        if dispatch_recv_buffer_slot is not None:
+            assert 0 <= dispatch_recv_buffer_slot < self._dispatch_recv_buffer_reuse_slots
+            assert not do_cpu_sync and not do_expand
+        if caller_managed_dispatch_recv_lifetime:
+            assert dispatch_recv_buffer_slot is None, \
+                "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive"
+            assert not async_with_compute_stream or allocate_on_comm_stream, \
+                "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream"
 
         # Do dispatch
         (recv_x, recv_sf,
@@ -993,7 +1027,9 @@ class ElasticBuffer:
                                         async_with_compute_stream, allocate_on_comm_stream,
                                         do_handle_copy, do_cpu_sync, do_expand,
                                         do_zero_padding,
-                                        use_tma_aligned_col_major_sf)
+                                        use_tma_aligned_col_major_sf,
+                                        dispatch_recv_buffer_slot,
+                                        caller_managed_dispatch_recv_lifetime)
 
         # Create handle
         is_cached_dispatch = handle is not None
