@@ -553,11 +553,17 @@ class ElasticBuffer:
     def set_dispatch_recv_buffer_reuse(self, num_slots: int) -> None:
         """Enable caller-managed dispatch receive-buffer slots.
 
-        Every dispatch using a slot that was used before must pass a
-        ``previous_event_before_epilogue`` covering the previous output's last
-        read.  Slot selection is explicit so callers can keep independent
-        rings for different lifetimes while the C++ runtime separates dtype
-        and scale-factor layouts.
+        Before reusing a slot, callers must order the copy epilogue after the
+        previous output's last read.  They may either merge that local fence
+        into the normal ``previous_event`` (which waits at communication
+        prologue), or pass ``previous_event_before_epilogue``.  The former is
+        preferable when the final reader belongs to the caller's main compute
+        stream because it does not insert a distinct retire dependency into
+        the middle of DeepEP's shared communication stream.
+
+        Slot selection is explicit so callers can keep independent rings for
+        different lifetimes while the C++ runtime separates dtype and
+        scale-factor layouts.
         """
         assert num_slots >= 0
         self._dispatch_recv_buffer_reuse_slots = num_slots
@@ -933,7 +939,9 @@ class ElasticBuffer:
             use_tma_aligned_col_major_sf: whether to use TMA-aligned column-major layout for scale factors.
             dispatch_recv_buffer_slot: optional caller-managed receive-buffer
                 slot. Requires ``set_dispatch_recv_buffer_reuse`` and a
-                device-only, non-expanded dispatch.
+                device-only, non-expanded dispatch. Before a reused slot is
+                overwritten, its previous final reader must be covered by
+                either ``previous_event`` or ``previous_event_before_epilogue``.
             caller_managed_dispatch_recv_lifetime: skip DeepEP's ``record_stream``
                 calls for ``recv_x`` and its scale tensor. The caller must keep
                 both tensors alive and record every stream that reads them.

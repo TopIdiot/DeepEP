@@ -55,10 +55,16 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     token_idx = torch.arange(num_tokens, device="cuda")
     topk_idx = ((token_idx + rank) % num_experts).to(deep_ep.topk_idx_t).view(-1, 1)
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda")
-    slot_fences = {}
+    slot_ready_events = {}
 
     def run_once(payload, slot):
         key = _reuse_key(payload)
+        # Merge the old slot's already-recorded local reader into the normal
+        # compute->comm event. No distinct retire wait enters comm_stream.
+        slot_ready = slot_ready_events.get((key, slot))
+        if slot_ready is not None:
+            torch.cuda.current_stream().wait_event(slot_ready)
+        previous_event = buffer.capture()
         reference, _, _, reference_src_idx, _ = ref_dispatch(
             payload,
             topk_idx,
@@ -74,8 +80,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             num_experts=num_experts,
             expert_alignment=1,
             do_cpu_sync=False,
-            previous_event=buffer.capture(),
-            previous_event_before_epilogue=slot_fences.get((key, slot)),
+            previous_event=previous_event,
             async_with_compute_stream=True,
             allocate_on_comm_stream=True,
             dispatch_recv_buffer_slot=slot,
@@ -84,7 +89,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         _check_dispatch(recv_x, handle, reference, reference_src_idx)
         # Queue a real consumer before publishing the slot's overwrite fence.
         snapshots = tuple(t.clone() for t in _as_tuple(recv_x))
-        slot_fences[(key, slot)] = buffer.capture()
+        slot_ready = torch.cuda.Event()
+        slot_ready.record(torch.cuda.current_stream())
+        slot_ready_events[(key, slot)] = slot_ready
         return _payload_ptrs(recv_x), snapshots
 
     def fp8_payload(offset):
