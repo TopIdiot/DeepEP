@@ -937,6 +937,8 @@ class ElasticBuffer:
             caller_managed_dispatch_recv_lifetime: skip DeepEP's ``record_stream``
                 calls for ``recv_x`` and its scale tensor. The caller must keep
                 both tensors alive and record every stream that reads them.
+                Asynchronous use requires ``allocate_on_comm_stream=True`` so
+                the communication producer remains the allocation owner.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
@@ -986,6 +988,11 @@ class ElasticBuffer:
         if dispatch_recv_buffer_slot is not None:
             assert 0 <= dispatch_recv_buffer_slot < self._dispatch_recv_buffer_reuse_slots
             assert not do_cpu_sync and not do_expand
+        if caller_managed_dispatch_recv_lifetime:
+            assert dispatch_recv_buffer_slot is None, \
+                "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive"
+            assert not async_with_compute_stream or allocate_on_comm_stream, \
+                "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream"
 
         # Do dispatch
         (recv_x, recv_sf,

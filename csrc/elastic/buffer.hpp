@@ -816,6 +816,9 @@ public:
         const bool reuse_dispatch_recv_buffer = dispatch_recv_buffer_slot.has_value();
         EP_HOST_ASSERT(not (reuse_dispatch_recv_buffer and caller_managed_dispatch_recv_lifetime) and
                        "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive");
+        EP_HOST_ASSERT((not caller_managed_dispatch_recv_lifetime or
+                        not async_with_compute_stream or allocate_on_comm_stream) and
+                       "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream");
         if (reuse_dispatch_recv_buffer) {
             EP_HOST_ASSERT(dispatch_recv_buffer_slot.value() >= 0);
             EP_HOST_ASSERT(not do_cpu_sync and not do_expand and
