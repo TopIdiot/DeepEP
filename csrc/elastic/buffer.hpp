@@ -1098,6 +1098,16 @@ public:
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
+        // Cached dispatch reports the exact receive size from its forward
+        // handle.  A slot shared by many layers would otherwise grow every
+        // time it sees a larger handle, releasing the old storage before the
+        // caller's stream-ordered reader fence has executed.  Slot reuse is
+        // restricted to non-expanded dispatch, so reserve its known worst
+        // case once and only narrow the returned view to the exact size.
+        const auto num_reusable_storage_tokens =
+            reuse_dispatch_recv_buffer and cached_mode
+                ? num_max_tokens_per_rank * nccl_context->num_ranks
+                : num_allocated_tokens;
         // Wait only after the communication body has completed, immediately
         // before storage for the chosen slot may be replaced or overwritten.
         if (reuse_dispatch_recv_buffer)
@@ -1112,6 +1122,7 @@ public:
                 ring_key |= (static_cast<int64_t>(sf->scalar_type()) + 1) << 8;
             if (use_tma_aligned_col_major_sf)
                 ring_key |= static_cast<int64_t>(1) << 16;
+            ring_key |= static_cast<int64_t>(hidden) << 32;
 
             auto& ring = dispatch_recv_buffer_rings[ring_key];
             const auto slot_idx = static_cast<size_t>(dispatch_recv_buffer_slot.value());
@@ -1124,10 +1135,10 @@ public:
                 reusable_slot->recv_x.scalar_type() != x.scalar_type() or
                 reusable_slot->recv_x.device() != x.device() or
                 reusable_slot->recv_x.size(1) != hidden or
-                reusable_slot->recv_x.size(0) < num_allocated_tokens or
+                reusable_slot->recv_x.size(0) < num_reusable_storage_tokens or
                 not reusable_slot->recv_x.is_contiguous();
             if (must_replace)
-                reusable_slot->recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+                reusable_slot->recv_x = torch::empty({num_reusable_storage_tokens, hidden}, x.options());
             recv_x = reusable_slot->recv_x.narrow(0, 0, num_allocated_tokens).detach();
         } else {
             recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
@@ -1149,7 +1160,7 @@ public:
                 recv_sf_token_stride = num_sf_packs, recv_sf_hidden_stride = 1;
             } else {
                 // TMA-aligned layout for the next GEMM input
-                recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_allocated_tokens, kNumAlignedSFPacks);
+                recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_reusable_storage_tokens, kNumAlignedSFPacks);
             }
             if (reuse_dispatch_recv_buffer) {
                 EP_HOST_ASSERT(reusable_slot != nullptr);
@@ -1165,7 +1176,7 @@ public:
                          : reusable_slot->recv_sf->stride(1) != recv_sf_hidden_stride);
                 if (must_replace) {
                     reusable_slot->recv_sf = torch::empty_strided(
-                        {num_allocated_tokens, num_sf_packs},
+                        {num_reusable_storage_tokens, num_sf_packs},
                         {recv_sf_token_stride, recv_sf_hidden_stride},
                         sf->options());
                 }

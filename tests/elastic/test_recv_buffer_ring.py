@@ -54,7 +54,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     token_idx = torch.arange(num_tokens, device="cuda")
     topk_idx = ((token_idx + rank) % num_experts).to(deep_ep.topk_idx_t).view(-1, 1)
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+    topk_weights = torch.ones(
+        (num_tokens, num_topk), dtype=torch.float32, device="cuda"
+    )
     slot_ready_events = {}
 
     def run_once(payload, slot):
@@ -92,24 +94,49 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         slot_ready = torch.cuda.Event()
         slot_ready.record(torch.cuda.current_stream())
         slot_ready_events[(key, slot)] = slot_ready
-        return _payload_ptrs(recv_x), snapshots
+        return _payload_ptrs(recv_x), snapshots, handle
 
     def fp8_payload(offset):
-        x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") + offset
+        x = (
+            torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+            + offset
+        )
         return per_token_cast_to_fp8(x)
 
-    fp8_slot0, _ = run_once(fp8_payload(0.0), 0)
-    fp8_slot1, _ = run_once(fp8_payload(4.0), 1)
-    bf16_slot0, _ = run_once(
+    fp8_slot0, _, _ = run_once(fp8_payload(0.0), 0)
+    fp8_slot1, _, _ = run_once(fp8_payload(4.0), 1)
+    bf16_slot0, _, bf16_handle = run_once(
         torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda"),
         0,
     )
-    fp8_slot0_reused, fp8_snapshot = run_once(fp8_payload(8.0), 0)
-    fp8_slot1_reused, _ = run_once(fp8_payload(12.0), 1)
-    bf16_slot0_reused, _ = run_once(
+    fp8_slot0_reused, fp8_snapshot, _ = run_once(fp8_payload(8.0), 0)
+    fp8_slot1_reused, _, _ = run_once(fp8_payload(12.0), 1)
+    bf16_slot0_reused, _, _ = run_once(
         torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") + 16,
         0,
     )
+
+    # A cached dispatch knows its exact receive count, which is generally
+    # smaller than the buffer contract's worst case.  The first use of an
+    # otherwise-empty reusable slot must nevertheless reserve the full
+    # capacity so sharing the slot across different layer handles never
+    # replaces storage while an earlier reader is still in flight.
+    backward_x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    previous_event = buffer.capture()
+    backward_recv, _, _, _, backward_event = buffer.dispatch(
+        x=backward_x,
+        handle=bf16_handle,
+        num_sms=bf16_handle.num_sms,
+        previous_event=previous_event,
+        async_with_compute_stream=True,
+        allocate_on_comm_stream=True,
+        dispatch_recv_buffer_slot=1,
+    )
+    backward_event.current_stream_wait()
+    expected_storage_bytes = (
+        world_size * num_tokens * hidden * backward_x.element_size()
+    )
+    assert backward_recv.untyped_storage().nbytes() >= expected_storage_bytes
 
     torch.cuda.synchronize()
     assert fp8_slot0 != fp8_slot1
