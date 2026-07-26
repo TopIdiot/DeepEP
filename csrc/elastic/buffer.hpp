@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <tuple>
 #include <vector>
 #include <pybind11/functional.h>
 
@@ -52,10 +53,26 @@ class ElasticBuffer {
         std::optional<torch::Tensor> recv_sf;
     };
 
+    struct DispatchRecvBufferKey {
+        int64_t x_dtype;
+        int64_t sf_dtype;
+        int64_t hidden;
+        int64_t num_sf_packs;
+        bool use_tma_aligned_col_major_sf;
+
+        bool operator<(const DispatchRecvBufferKey& other) const {
+            return std::tie(x_dtype, sf_dtype, hidden, num_sf_packs, use_tma_aligned_col_major_sf) <
+                   std::tie(other.x_dtype, other.sf_dtype, other.hidden, other.num_sf_packs,
+                            other.use_tma_aligned_col_major_sf);
+        }
+    };
+
     // Reusable dispatch outputs are opt-in per call.  Rings are separated by
-    // x/sf dtype and SF layout so FP8 forward and BF16 backward never alias.
+    // every caller-visible storage-layout field so incompatible payloads never
+    // alias the same slot ID. The ElasticBuffer itself is bound to one device.
     // The caller supplies the slot index and an overwrite fence for that slot.
-    mutable std::map<int64_t, std::vector<DispatchRecvBufferSlot>> dispatch_recv_buffer_rings;
+    mutable std::map<DispatchRecvBufferKey, std::vector<DispatchRecvBufferSlot>> dispatch_recv_buffer_rings;
+    int num_dispatch_recv_buffer_slots = 0;
 
     // Timeout settings
     int num_cpu_timeout_secs;
@@ -166,6 +183,9 @@ public:
         // Finish all works on all GPUs
         barrier(true, true);
 
+        // Release persistent receive slots while the runtime is known idle.
+        dispatch_recv_buffer_rings.clear();
+
         // Deallocate host workspaces
         CUDA_RUNTIME_CHECK(cudaFreeHost(host_workspace));
 
@@ -174,6 +194,33 @@ public:
 
         // Cannot use anymore
         destroyed = true;
+    }
+
+    void set_dispatch_recv_buffer_reuse(const int& num_slots) {
+        EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(num_slots >= 0);
+
+        // Shrinking may release comm-stream-owned storage, so first finish all
+        // producers and caller-recorded readers on this device. Growing only
+        // changes the accepted index range and does not allocate anything.
+        if (num_slots < num_dispatch_recv_buffer_slots) {
+            CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
+            if (num_slots == 0) {
+                dispatch_recv_buffer_rings.clear();
+            } else {
+                for (auto& [_, ring]: dispatch_recv_buffer_rings) {
+                    if (ring.size() > static_cast<size_t>(num_slots))
+                        ring.resize(num_slots);
+                }
+            }
+        }
+        num_dispatch_recv_buffer_slots = num_slots;
+    }
+
+    void release_dispatch_recv_buffers() {
+        EP_HOST_ASSERT(not destroyed);
+        CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
+        dispatch_recv_buffer_rings.clear();
     }
 
     torch::Stream get_comm_stream() const {
@@ -809,10 +856,6 @@ public:
             cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
         }
 
-        // Stream control
-        // All new tensor allocations should happen after this
-        const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
-
         const bool reuse_dispatch_recv_buffer = dispatch_recv_buffer_slot.has_value();
         EP_HOST_ASSERT(not (reuse_dispatch_recv_buffer and caller_managed_dispatch_recv_lifetime) and
                        "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive");
@@ -820,10 +863,20 @@ public:
                         not async_with_compute_stream or allocate_on_comm_stream) and
                        "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream");
         if (reuse_dispatch_recv_buffer) {
-            EP_HOST_ASSERT(dispatch_recv_buffer_slot.value() >= 0);
+            EP_HOST_ASSERT(dispatch_recv_buffer_slot.value() >= 0 and
+                           dispatch_recv_buffer_slot.value() < num_dispatch_recv_buffer_slots and
+                           "Dispatch receive-buffer slot is outside the configured range");
             EP_HOST_ASSERT(not do_cpu_sync and not do_expand and
                            "Reusable dispatch recv buffers require a device-only, non-expanded dispatch");
+            EP_HOST_ASSERT((not async_with_compute_stream or allocate_on_comm_stream) and
+                           "Reusable asynchronous dispatch receive storage must be allocated on the communication stream");
         }
+
+        // Stream control
+        // All new tensor allocations should happen after this. Keep argument
+        // validation above so a rejected call cannot leave the current stream
+        // changed to the communication stream.
+        const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
 
         // The number of received tokens per expert
         // This is useful for expanding mode
@@ -1104,10 +1157,9 @@ public:
         // caller's stream-ordered reader fence has executed.  Slot reuse is
         // restricted to non-expanded dispatch, so reserve its known worst
         // case once and only narrow the returned view to the exact size.
-        const auto num_reusable_storage_tokens =
-            reuse_dispatch_recv_buffer and cached_mode
-                ? num_max_tokens_per_rank * nccl_context->num_ranks
-                : num_allocated_tokens;
+        const auto num_reusable_storage_tokens = reuse_dispatch_recv_buffer
+            ? num_max_tokens_per_rank * nccl_context->num_ranks
+            : num_allocated_tokens;
         // Wait only after the communication body has completed, immediately
         // before storage for the chosen slot may be replaced or overwritten.
         if (reuse_dispatch_recv_buffer)
@@ -1117,12 +1169,12 @@ public:
         auto recv_sf = std::optional<torch::Tensor>();
         DispatchRecvBufferSlot* reusable_slot = nullptr;
         if (reuse_dispatch_recv_buffer) {
-            int64_t ring_key = static_cast<int64_t>(x.scalar_type());
-            if (sf.has_value())
-                ring_key |= (static_cast<int64_t>(sf->scalar_type()) + 1) << 8;
-            if (use_tma_aligned_col_major_sf)
-                ring_key |= static_cast<int64_t>(1) << 16;
-            ring_key |= static_cast<int64_t>(hidden) << 32;
+            const auto ring_key = DispatchRecvBufferKey{
+                static_cast<int64_t>(x.scalar_type()),
+                sf.has_value() ? static_cast<int64_t>(sf->scalar_type()) : -1,
+                hidden,
+                num_sf_packs,
+                use_tma_aligned_col_major_sf};
 
             auto& ring = dispatch_recv_buffer_rings[ring_key];
             const auto slot_idx = static_cast<size_t>(dispatch_recv_buffer_slot.value());
@@ -1159,29 +1211,25 @@ public:
             if (not use_tma_aligned_col_major_sf) {
                 recv_sf_token_stride = num_sf_packs, recv_sf_hidden_stride = 1;
             } else {
-                // TMA-aligned layout for the next GEMM input
-                recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_reusable_storage_tokens, kNumAlignedSFPacks);
+                // Preserve the public logical layout even when the reusable
+                // backing storage reserves more rows than this returned view.
+                recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_allocated_tokens, kNumAlignedSFPacks);
             }
             if (reuse_dispatch_recv_buffer) {
                 EP_HOST_ASSERT(reusable_slot != nullptr);
+                const int64_t num_storage_elements = static_cast<int64_t>(num_sf_packs) *
+                    (use_tma_aligned_col_major_sf
+                         ? math::align(num_reusable_storage_tokens, kNumAlignedSFPacks)
+                         : num_reusable_storage_tokens);
                 const bool must_replace =
                     not reusable_slot->recv_sf.has_value() or
                     reusable_slot->recv_sf->scalar_type() != sf->scalar_type() or
                     reusable_slot->recv_sf->device() != sf->device() or
-                    reusable_slot->recv_sf->size(1) != num_sf_packs or
-                    reusable_slot->recv_sf->size(0) < num_allocated_tokens or
-                    reusable_slot->recv_sf->stride(0) != recv_sf_token_stride or
-                    (use_tma_aligned_col_major_sf
-                         ? reusable_slot->recv_sf->stride(1) < recv_sf_hidden_stride
-                         : reusable_slot->recv_sf->stride(1) != recv_sf_hidden_stride);
-                if (must_replace) {
-                    reusable_slot->recv_sf = torch::empty_strided(
-                        {num_reusable_storage_tokens, num_sf_packs},
-                        {recv_sf_token_stride, recv_sf_hidden_stride},
-                        sf->options());
-                }
-                recv_sf_token_stride = reusable_slot->recv_sf->stride(0);
-                recv_sf_hidden_stride = reusable_slot->recv_sf->stride(1);
+                    reusable_slot->recv_sf->dim() != 1 or
+                    reusable_slot->recv_sf->numel() < num_storage_elements or
+                    not reusable_slot->recv_sf->is_contiguous();
+                if (must_replace)
+                    reusable_slot->recv_sf = torch::empty({num_storage_elements}, sf->options());
                 recv_sf = reusable_slot->recv_sf->as_strided(
                     {num_allocated_tokens, num_sf_packs},
                     {recv_sf_token_stride, recv_sf_hidden_stride}).detach();
@@ -1449,6 +1497,8 @@ static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
         .def("destroy", &ElasticBuffer::destroy)
+        .def("set_dispatch_recv_buffer_reuse", &ElasticBuffer::set_dispatch_recv_buffer_reuse)
+        .def("release_dispatch_recv_buffers", &ElasticBuffer::release_dispatch_recv_buffers)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)

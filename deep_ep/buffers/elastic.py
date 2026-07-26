@@ -562,11 +562,25 @@ class ElasticBuffer:
         the middle of DeepEP's shared communication stream.
 
         Slot selection is explicit so callers can keep independent rings for
-        different lifetimes while the C++ runtime separates dtype and
-        scale-factor layouts.
+        different lifetimes while the C++ runtime separates dtype, hidden
+        size, scale-factor width, and scale-factor layouts. Returned tensors
+        are overwritten when their slot is reused; raw communication-kernel
+        writes do not bump PyTorch version counters, so callers must not retain
+        or save a view past its published final-reader fence.
         """
-        assert num_slots >= 0
+        if not isinstance(num_slots, int) or num_slots < 0:
+            raise ValueError("num_slots must be a nonnegative integer")
+        self.runtime.set_dispatch_recv_buffer_reuse(num_slots)
         self._dispatch_recv_buffer_reuse_slots = num_slots
+
+    def release_dispatch_recv_buffers(self) -> None:
+        """Synchronize this device and release all persistent dispatch receive storage.
+
+        Configured slot indices remain enabled and will allocate fresh storage
+        on their next use. Use ``set_dispatch_recv_buffer_reuse(0)`` instead to
+        release the storage and disable slot reuse.
+        """
+        self.runtime.release_dispatch_recv_buffers()
 
     def get_physical_domain_size(self) -> Tuple[int, int]:
         """
@@ -942,6 +956,10 @@ class ElasticBuffer:
                 device-only, non-expanded dispatch. Before a reused slot is
                 overwritten, its previous final reader must be covered by
                 either ``previous_event`` or ``previous_event_before_epilogue``.
+                Asynchronous use requires ``allocate_on_comm_stream=True``.
+                TMA-aligned scale-factor views retain the normal stride derived
+                from their logical received-token count, independent of the
+                reusable slot's backing capacity.
             caller_managed_dispatch_recv_lifetime: skip DeepEP's ``record_stream``
                 calls for ``recv_x`` and its scale tensor. The caller must keep
                 both tensors alive and record every stream that reads them.
@@ -994,13 +1012,21 @@ class ElasticBuffer:
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
         if dispatch_recv_buffer_slot is not None:
-            assert 0 <= dispatch_recv_buffer_slot < self._dispatch_recv_buffer_reuse_slots
-            assert not do_cpu_sync and not do_expand
+            if not 0 <= dispatch_recv_buffer_slot < self._dispatch_recv_buffer_reuse_slots:
+                raise ValueError("dispatch_recv_buffer_slot is outside the configured range")
+            if do_cpu_sync or do_expand:
+                raise ValueError("Reusable dispatch recv buffers require a device-only, non-expanded dispatch")
+            if async_with_compute_stream and not allocate_on_comm_stream:
+                raise ValueError(
+                    "Reusable asynchronous dispatch receive storage must be allocated on the communication stream"
+                )
         if caller_managed_dispatch_recv_lifetime:
-            assert dispatch_recv_buffer_slot is None, \
-                "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive"
-            assert not async_with_compute_stream or allocate_on_comm_stream, \
-                "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream"
+            if dispatch_recv_buffer_slot is not None:
+                raise ValueError("Reusable and caller-managed dispatch receive lifetimes are mutually exclusive")
+            if async_with_compute_stream and not allocate_on_comm_stream:
+                raise ValueError(
+                    "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream"
+                )
 
         # Do dispatch
         (recv_x, recv_sf,
