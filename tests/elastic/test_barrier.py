@@ -2,12 +2,12 @@ import argparse
 import torch
 import torch.distributed as dist
 
-import deep_ep
-from deep_ep.utils.envs import init_dist, dist_print
-from deep_ep.utils.testing import bench_kineto
+import deep_ep_ring
+from deep_ep_ring.utils.envs import init_dist, dist_print
+from deep_ep_ring.utils.testing import bench_kineto
 
 
-def test_barrier(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
+def test_barrier(buffer: deep_ep_ring.ElasticBuffer, args: argparse.Namespace):
     dist_print('Profiling barrier:', once_in_node=True)
     num_scaleout_ranks, num_scaleup_ranks = buffer.get_logical_domain_size()
     dist_print(f'Config:\n'
@@ -33,7 +33,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     do_pressure_test = args.do_pressure_test
     for i in range(int(1e9) if do_pressure_test else 1):
-        buffer = deep_ep.ElasticBuffer(
+        buffer = deep_ep_ring.ElasticBuffer(
             group, num_bytes=2 ** 30,
             allow_hybrid_mode=args.allow_hybrid_mode,
             num_allocated_qps=args.num_allocated_qps,

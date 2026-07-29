@@ -4,18 +4,18 @@ import torch
 import torch.distributed as dist
 from typing import Union, Tuple, Optional
 
-import deep_ep
-from deep_ep.utils.math import (
+import deep_ep_ring
+from deep_ep_ring.utils.math import (
     align, count_bytes, calc_diff,
     per_token_cast_back, per_token_cast_to_fp8,
     safe_div
 )
-from deep_ep.utils.gate import get_unbalanced_scores
-from deep_ep.utils.envs import init_dist, init_seed, dist_print
-from deep_ep.utils.refs import dispatch as ref_dispatch
-from deep_ep.utils.refs import combine as ref_combine
-from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate
-from deep_ep.utils.testing import bench_kineto
+from deep_ep_ring.utils.gate import get_unbalanced_scores
+from deep_ep_ring.utils.envs import init_dist, init_seed, dist_print
+from deep_ep_ring.utils.refs import dispatch as ref_dispatch
+from deep_ep_ring.utils.refs import combine as ref_combine
+from deep_ep_ring.utils.refs import generate_pre_combine_data, ordered_accumulate
+from deep_ep_ring.utils.testing import bench_kineto
 
 
 # noinspection PyUnusedLocal,PyShadowingNames
@@ -31,7 +31,7 @@ def enumerate_ep_modes():
                                        with_previous_event, async_with_compute_stream, allocate_on_comm_stream)
 
 
-def launch(buffer: deep_ep.ElasticBuffer, name: str,
+def launch(buffer: deep_ep_ring.ElasticBuffer, name: str,
            with_previous_event: int, async_with_compute_stream: int,
            params: dict):
     if with_previous_event:
@@ -56,7 +56,7 @@ def fold_expanded(expanded: Union[Tuple[torch.Tensor], torch.Tensor],
 
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
-def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
+def test_dispatch_combine(buffer: deep_ep_ring.ElasticBuffer, args: argparse.Namespace):
     # Settings
     num_scaleout_ranks, num_scaleup_ranks = buffer.get_logical_domain_size()
     num_max_tokens_per_rank, num_tokens, hidden = args.num_tokens, max(1, args.num_tokens - dist.get_rank()), args.hidden
@@ -74,7 +74,7 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
     # Construct expert selections first (may have an unbalanced ratio here)
     scores = get_unbalanced_scores(num_tokens, num_experts, buffer.num_ranks, num_topk, args.unbalanced_ratio, args.precise_unbalanced_ratio)
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+    topk_idx = topk_idx.to(deep_ep_ring.topk_idx_t)
     if args.masked_ratio > 0:
         rand_mask = torch.rand_like(topk_idx, dtype=torch.float)
         topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
@@ -521,7 +521,7 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks, seed=args.seed)
     def construct_elastic_buffer():
-        return deep_ep.ElasticBuffer(group,
+        return deep_ep_ring.ElasticBuffer(group,
                                      num_max_tokens_per_rank=args.num_tokens, hidden=args.hidden,
                                      deterministic=args.deterministic,
                                      allow_hybrid_mode=args.allow_hybrid_mode,

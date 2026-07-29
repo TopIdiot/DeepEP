@@ -6,10 +6,10 @@ import gc
 import torch
 import torch.distributed as dist
 
-import deep_ep
-from deep_ep.utils.envs import init_dist
-from deep_ep.utils.math import per_token_cast_to_fp8
-from deep_ep.utils.refs import dispatch as ref_dispatch
+import deep_ep_ring
+from deep_ep_ring.utils.envs import init_dist
+from deep_ep_ring.utils.math import per_token_cast_to_fp8
+from deep_ep_ring.utils.refs import dispatch as ref_dispatch
 
 
 def _as_tuple(value):
@@ -61,7 +61,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Size for BF16; the same ElasticBuffer can then exercise BF16 and FP8
     # receive rings without changing the communication arena.
-    buffer = deep_ep.ElasticBuffer(
+    buffer = deep_ep_ring.ElasticBuffer(
         group,
         num_max_tokens_per_rank=num_tokens,
         hidden=hidden,
@@ -72,8 +72,24 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     buffer.set_dispatch_recv_buffer_reuse(2)
 
+    # Provision all persistent receive layouts before the schedule begins.
+    # The following dispatches must reuse these allocations rather than make
+    # their first persistent allocation in the middle of the schedule.
+    assert hidden % 128 == 0
+    buffer.reserve_dispatch_recv_buffers(
+        payloads=(
+            torch.empty((1, hidden), dtype=torch.bfloat16, device="cuda"),
+            (
+                torch.empty((1, hidden), dtype=torch.float8_e4m3fn, device="cuda"),
+                torch.empty((1, hidden // 128), dtype=torch.float32, device="cuda"),
+            ),
+        ),
+        slot_ids=(0, 1),
+        num_max_tokens_per_rank=num_tokens,
+    )
+
     token_idx = torch.arange(num_tokens, device="cuda")
-    large_topk_idx = ((token_idx + rank) % num_experts).to(deep_ep.topk_idx_t).view(-1, 1)
+    large_topk_idx = ((token_idx + rank) % num_experts).to(deep_ep_ring.topk_idx_t).view(-1, 1)
     small_topk_idx = torch.full_like(large_topk_idx, -1)
     small_topk_idx[:world_size, 0] = torch.arange(world_size, device="cuda") * (num_experts // world_size)
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda")

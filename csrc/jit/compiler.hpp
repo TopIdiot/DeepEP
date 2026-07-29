@@ -49,7 +49,7 @@ public:
         EP_HOST_ASSERT(not cuobjdump_path.empty());
 
         // Cache settings
-        cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_ep";
+        cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_ep_ring";
         if (const auto env_cache_dir_path = get_env<std::string>("EP_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
             cache_dir_path = env_cache_dir_path;
 

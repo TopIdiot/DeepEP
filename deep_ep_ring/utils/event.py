@@ -2,7 +2,7 @@ import torch
 from typing import Any, Optional, Tuple, Callable
 
 # noinspection PyUnresolvedReferences
-from deep_ep._C import EventHandle
+from deep_ep_ring._C import EventHandle
 
 
 class EventOverlap:

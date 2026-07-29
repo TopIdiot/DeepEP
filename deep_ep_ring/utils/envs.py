@@ -9,7 +9,7 @@ import torch.distributed as dist
 from typing import Tuple
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+import deep_ep_ring._C as _C
 
 from .comm import get_nccl_comm_handle
 

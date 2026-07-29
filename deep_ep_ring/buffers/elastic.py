@@ -7,9 +7,9 @@ from typing import Callable, Optional, Tuple, Union, List, Sequence
 from contextlib import contextmanager
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+import deep_ep_ring._C as _C
 # noinspection PyUnresolvedReferences
-from deep_ep._C import EventHandle
+from deep_ep_ring._C import EventHandle
 
 from ..utils.event import EventOverlap
 from ..utils.math import align
@@ -567,6 +567,12 @@ class ElasticBuffer:
         are overwritten when their slot is reused; raw communication-kernel
         writes do not bump PyTorch version counters, so callers must not retain
         or save a view past its published final-reader fence.
+
+        Reducing the configured slot count performs a blocking
+        ``cudaDeviceSynchronize()`` before releasing storage. Callers must do
+        that only at a device-wide quiescent point with no in-flight
+        peer-dependent communication. Increasing the count does not
+        synchronize or allocate storage.
         """
         if not isinstance(num_slots, int) or num_slots < 0:
             raise ValueError("num_slots must be a nonnegative integer")
@@ -579,8 +585,36 @@ class ElasticBuffer:
         Configured slot indices remain enabled and will allocate fresh storage
         on their next use. Use ``set_dispatch_recv_buffer_reuse(0)`` instead to
         release the storage and disable slot reuse.
+
+        This method performs a blocking ``cudaDeviceSynchronize()``. Call it
+        only at a device-wide quiescent point with no in-flight peer-dependent
+        communication; otherwise synchronization may wait indefinitely for a
+        communication kernel whose peer has not progressed.
         """
         self.runtime.release_dispatch_recv_buffers()
+
+    def reserve_dispatch_recv_buffers(self,
+                                      payloads: Sequence[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]],
+                                      slot_ids: Sequence[int],
+                                      num_max_tokens_per_rank: Optional[int] = None) -> None:
+        """Allocate every reusable dispatch-output layout before scheduling.
+
+        ``payloads`` contain one-row representatives of the public BF16 or
+        FP8+scale layouts. The runtime expands them to the non-expanded receive
+        capacity on every selected slot without launching communication.
+        """
+        if self._dispatch_recv_buffer_reuse_slots <= 0:
+            raise RuntimeError("set_dispatch_recv_buffer_reuse must be called before reserve")
+        if not slot_ids or any(
+                not isinstance(slot, int) or not 0 <= slot < self._dispatch_recv_buffer_reuse_slots
+                for slot in slot_ids):
+            raise ValueError("slot_ids must be nonempty and inside the configured reusable range")
+        capacity = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
+        for payload in payloads:
+            x, sf = payload if isinstance(payload, tuple) else (payload, None)
+            if x.shape[0] != 1 or (sf is not None and sf.shape[0] != 1):
+                raise ValueError("reserve payload representatives must have exactly one row")
+            self.runtime.reserve_dispatch_recv_buffers(x, sf, list(slot_ids), capacity, False)
 
     def get_physical_domain_size(self) -> Tuple[int, int]:
         """
@@ -921,7 +955,7 @@ class ElasticBuffer:
                 `[num_tokens, hidden]`, and type must be `torch.bfloat16`; for the second type (FP8 mode),
                 the first element of the tuple must be `[num_tokens, hidden]` with type `torch.float8_e4m3fn`,
                 the second is the scale factors.
-            topk_idx: `[num_tokens, num_topk]` with `deep_ep.topk_idx_t` (typically `torch.int64`), the expert
+            topk_idx: `[num_tokens, num_topk]` with `deep_ep_ring.topk_idx_t` (typically `torch.int64`), the expert
                 indices selected by each token, `-1` means no selections.
                 Must be `None` if `handle` is provided.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token to dispatch.

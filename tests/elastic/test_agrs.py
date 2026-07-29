@@ -5,8 +5,8 @@ import torch
 import torch.distributed as dist
 import numpy as np
 
-import deep_ep
-from deep_ep.utils.envs import init_dist, dist_print
+import deep_ep_ring
+from deep_ep_ring.utils.envs import init_dist, dist_print
 
 
 def all_gather_ref(shape: tuple, rank_idx: int, num_ranks: int, round_idx: int = 0):
@@ -54,7 +54,7 @@ def generate_stress_ops(
     return ops, tensors, refs
 
 
-def do_all_gather(buffer: deep_ep.ElasticBuffer,
+def do_all_gather(buffer: deep_ep_ring.ElasticBuffer,
                   is_inplace: bool, is_batched: bool,
                   tensors: tuple[torch.Tensor, ...],
                   start_event: torch.cuda.Event | None = None):
@@ -92,12 +92,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Print configs
     shape = (32, 64, 2048)
     num_max_inflight_agrs = args.num_max_inflight_agrs
-    num_max_session_bytes = deep_ep.ElasticBuffer.get_agrs_num_max_session_bytes(
+    num_max_session_bytes = deep_ep_ring.ElasticBuffer.get_agrs_num_max_session_bytes(
         group,
         [shape for _ in range(num_max_inflight_agrs)],
         torch.bfloat16
     )
-    num_max_session_bytes = deep_ep.ElasticBuffer.get_agrs_buffer_size_hint(
+    num_max_session_bytes = deep_ep_ring.ElasticBuffer.get_agrs_buffer_size_hint(
         group, num_max_session_bytes)
     dist_print(f'Config:\n'
                f' > Ranks: {num_ranks}\n'
@@ -106,7 +106,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                once_in_node=True)
 
     # Create buffer
-    buffer = deep_ep.ElasticBuffer(group, explicitly_destroy=True, num_bytes=num_max_session_bytes)
+    buffer = deep_ep_ring.ElasticBuffer(group, explicitly_destroy=True, num_bytes=num_max_session_bytes)
     buffer.agrs_set_config(num_max_session_bytes, num_max_inflight_agrs)
 
     # Run stress tests
@@ -144,14 +144,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer.destroy()
 
     # Profiling
-    num_max_session_bytes = deep_ep.ElasticBuffer.get_agrs_num_max_session_bytes(
+    num_max_session_bytes = deep_ep_ring.ElasticBuffer.get_agrs_num_max_session_bytes(
         group,
         [(2 ** 26,) for _ in range(num_max_inflight_agrs)],
         torch.bfloat16
     )
-    num_max_session_bytes = deep_ep.ElasticBuffer.get_agrs_buffer_size_hint(
+    num_max_session_bytes = deep_ep_ring.ElasticBuffer.get_agrs_buffer_size_hint(
         group, num_max_session_bytes)
-    buffer = deep_ep.ElasticBuffer(group, explicitly_destroy=True, num_bytes=num_max_session_bytes)
+    buffer = deep_ep_ring.ElasticBuffer(group, explicitly_destroy=True, num_bytes=num_max_session_bytes)
     buffer.agrs_set_config(num_max_session_bytes, num_max_inflight_agrs)
     for num_bytes in (2 ** p for p in range(20, 27)):
         # Create tensors

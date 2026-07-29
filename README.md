@@ -1,4 +1,9 @@
-# DeepEP
+# DeepEP Ring
+
+This branch packages the payload-ring-enabled DeepEP fork as
+`deep-ep-ring` / `deep_ep_ring` so it can be installed alongside the official
+`deep_ep` package. The native C++ namespace and installed header layout remain
+`deep_ep` for source compatibility.
 
 DeepEP (DeepEveryParallel) is a high-performance communication library for modern machine learning training and inference. The library currently focuses on expert parallelism (EP) — providing high-throughput and low-latency all-to-all GPU kernels (MoE dispatch and combine) with low-precision support including FP8 — while also offering experimental primitives for pipeline parallelism (PP), context parallelism (CP), and remote memory access (Engram), all designed for zero or minimal SM occupation. All kernels are compiled at runtime via a lightweight Just-In-Time (JIT) module, requiring no CUDA compilation during installation.
 
@@ -86,10 +91,8 @@ DeepEP also depends on NVSHMEM to provide support for legacy methods. Please ref
 ### Development
 
 ```bash
-# Build and make symbolic links for SO files
-python setup.py build
-# You may modify the specific SO names according to your own platform
-ln -s build/lib.linux-x86_64-cpython-38/deep_ep_cpp.cpython-38-x86_64-linux-gnu.so
+# Build and link the extension into deep_ep_ring/
+./develop.sh
 
 # Run test cases
 # NOTES: you may modify the `init_dist` function in `tests/utils/envs.py`
@@ -106,7 +109,7 @@ python tests/elastic/test_pp.py
 python setup.py install
 ```
 
-Then, import `deep_ep` in your Python project, and enjoy!
+Then, import `deep_ep_ring` in your Python project, and enjoy!
 
 ## Interfaces and examples
 
@@ -119,7 +122,7 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
-from deep_ep import ElasticBuffer
+from deep_ep_ring import ElasticBuffer
 
 # Communication buffer (will allocate at runtime)
 _buffer: Optional[ElasticBuffer] = None
@@ -171,7 +174,7 @@ import torch
 import torch.distributed as dist
 from typing import Tuple, Union
 
-from deep_ep import ElasticBuffer, EPHandle, EventOverlap
+from deep_ep_ring import ElasticBuffer, EPHandle, EventOverlap
 
 
 def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -274,7 +277,7 @@ For inference decoding, the same `ElasticBuffer` is used. The handle-caching pat
 import torch
 from typing import Tuple, Optional, Union
 
-from deep_ep import ElasticBuffer, EPHandle, EventOverlap
+from deep_ep_ring import ElasticBuffer, EPHandle, EventOverlap
 
 
 def decode_dispatch(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -343,7 +346,7 @@ The library provides some environment variables, which may be useful:
     - `EP_DISABLE_GIN`: `0` or `1`, disable the NCCL Gin backend (fall back to non-Gin path), `0` by default
 - JIT
     - `EP_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
-    - `EP_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_ep` by default
+    - `EP_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_ep_ring` by default
     - `EP_JIT_NVCC_COMPILER`: string, NVCC compiler path; defaults to `torch.utils.cpp_extension.CUDA_HOME`
     - `EP_JIT_CPP_STANDARD`: integer, C++ standard version, `20` by default
     - `EP_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print compilation commands, `0` by default

@@ -1,6 +1,6 @@
 # NOTES: this CMake is only for debugging; for setup, please use Torch extension
 cmake_minimum_required(VERSION 3.10)
-project(deep_ep LANGUAGES CUDA CXX)
+project(deep_ep_ring LANGUAGES CUDA CXX)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -fPIC")
@@ -37,7 +37,7 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 
-include_directories(deep_ep/include third-party/fmt/include)
+include_directories(deep_ep_ring/include third-party/fmt/include)
 include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include ${CUDA_TOOLKIT_ROOT_DIR}/include/cccl ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS} ${NVSHMEM_INCLUDE_DIR} ${NCCL_ROOT_DIR}/include .)
 link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib ${NVSHMEM_LIB_DIR} ${NCCL_ROOT_DIR}/lib)
 

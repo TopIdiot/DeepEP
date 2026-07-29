@@ -69,9 +69,14 @@ class ElasticBuffer {
 
     // Reusable dispatch outputs are opt-in per call.  Rings are separated by
     // every caller-visible storage-layout field so incompatible payloads never
-    // alias the same slot ID. The ElasticBuffer itself is bound to one device.
+    // alias the same slot ID. The ElasticBuffer itself is bound to one device;
+    // the device predicates in must_replace are defensive invariant checks,
+    // not another key dimension.
     // The caller supplies the slot index and an overwrite fence for that slot.
-    mutable std::map<DispatchRecvBufferKey, std::vector<DispatchRecvBufferSlot>> dispatch_recv_buffer_rings;
+    // Calls on one ElasticBuffer must remain single-threaded. The Python
+    // binding currently enforces that by retaining the GIL; add locking here
+    // before any binding starts releasing it around dispatch.
+    std::map<DispatchRecvBufferKey, std::vector<DispatchRecvBufferSlot>> dispatch_recv_buffer_rings;
     int num_dispatch_recv_buffer_slots = 0;
 
     // Timeout settings
@@ -221,6 +226,46 @@ public:
         EP_HOST_ASSERT(not destroyed);
         CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
         dispatch_recv_buffer_rings.clear();
+    }
+
+    void reserve_dispatch_recv_buffers(const torch::Tensor& x,
+                                       const std::optional<torch::Tensor>& sf,
+                                       const std::vector<int64_t>& slot_ids,
+                                       const int& num_max_tokens_per_rank,
+                                       const bool& use_tma_aligned_col_major_sf) {
+        EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(x.dim() == 2 and x.size(0) == 1 and x.is_contiguous());
+        EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
+        if (sf.has_value())
+            EP_HOST_ASSERT(sf->dim() == 2 and sf->size(0) == 1 and sf->is_contiguous() and
+                           sf->device() == x.device());
+        const auto hidden = x.size(1);
+        const auto num_sf_packs = sf.has_value() ? sf->size(1) : 0;
+        const auto ring_key = DispatchRecvBufferKey{
+            static_cast<int64_t>(x.scalar_type()),
+            sf.has_value() ? static_cast<int64_t>(sf->scalar_type()) : -1,
+            hidden,
+            num_sf_packs,
+            use_tma_aligned_col_major_sf};
+        auto& ring = dispatch_recv_buffer_rings[ring_key];
+        const auto num_storage_tokens =
+            static_cast<int64_t>(num_max_tokens_per_rank) * nccl_context->num_ranks;
+        for (const auto slot_id: slot_ids) {
+            EP_HOST_ASSERT(slot_id >= 0 and slot_id < num_dispatch_recv_buffer_slots);
+            if (ring.size() <= static_cast<size_t>(slot_id))
+                ring.resize(static_cast<size_t>(slot_id) + 1);
+            auto& slot = ring[static_cast<size_t>(slot_id)];
+            slot.recv_x = torch::empty({num_storage_tokens, hidden}, x.options());
+            if (sf.has_value()) {
+                const int64_t num_storage_elements = static_cast<int64_t>(num_sf_packs) *
+                    (use_tma_aligned_col_major_sf
+                         ? math::align<int64_t>(num_storage_tokens, kNumAlignedSFPacks)
+                         : num_storage_tokens);
+                slot.recv_sf = torch::empty({num_storage_elements}, sf->options());
+            } else {
+                slot.recv_sf.reset();
+            }
+        }
     }
 
     torch::Stream get_comm_stream() const {
@@ -783,7 +828,7 @@ public:
              const bool& do_expand, const bool& do_zero_padding,
              const bool& use_tma_aligned_col_major_sf,
              const std::optional<int>& dispatch_recv_buffer_slot,
-             const bool& caller_managed_dispatch_recv_lifetime) const {
+             const bool& caller_managed_dispatch_recv_lifetime) {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1498,6 +1543,7 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("set_dispatch_recv_buffer_reuse", &ElasticBuffer::set_dispatch_recv_buffer_reuse)
+        .def("reserve_dispatch_recv_buffers", &ElasticBuffer::reserve_dispatch_recv_buffers)
         .def("release_dispatch_recv_buffers", &ElasticBuffer::release_dispatch_recv_buffers)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)

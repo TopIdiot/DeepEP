@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+import deep_ep_ring._C as _C
 
 
 class NCCLCommHandle:

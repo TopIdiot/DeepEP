@@ -4,9 +4,9 @@ import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
-import deep_ep._C as _C
+import deep_ep_ring._C as _C
 # noinspection PyUnresolvedReferences
-from deep_ep._C import Config, EventHandle
+from deep_ep_ring._C import Config, EventHandle
 from ..utils.event import EventOverlap
 from ..utils.envs import check_nvlink_connections, check_torch_deterministic
 
@@ -298,7 +298,7 @@ class Buffer:
         Calculate the layout required for later communication.
 
         Arguments:
-            topk_idx: `[num_tokens, num_topk]`, dtype must be `deep_ep.topk_idx_t` (typically `torch.int64`), the expert
+            topk_idx: `[num_tokens, num_topk]`, dtype must be `deep_ep_ring.topk_idx_t` (typically `torch.int64`), the expert
                 indices selected by each token, `-1` means no selections.
             num_experts: the number of experts.
             previous_event: the event to wait before actually executing the kernel.
@@ -347,7 +347,7 @@ class Buffer:
                 rank (with the same GPU index), return `None` for intranode settings.
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
             num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
-            topk_idx: `[num_tokens, num_topk]` with `deep_ep.topk_idx_t` (typically `torch.int64`), the expert indices
+            topk_idx: `[num_tokens, num_topk]` with `deep_ep_ring.topk_idx_t` (typically `torch.int64`), the expert indices
                 selected by each token, `-1` means no selections.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token to dispatch.
             expert_alignment: align the number of tokens received by each local expert to this variable.
@@ -567,7 +567,7 @@ class Buffer:
         Arguments:
             x: `torch.Tensor` with `torch.bfloat16`, shaped as `[num_tokens, hidden]`, only several hidden shapes are
                 supported. The number of tokens to be dispatched must be less than `num_max_dispatch_tokens_per_rank`.
-            topk_idx: `torch.Tensor` with `deep_ep.topk_idx_t` (typically `torch.int64`), shaped as `[num_tokens, num_topk]`,
+            topk_idx: `torch.Tensor` with `deep_ep_ring.topk_idx_t` (typically `torch.int64`), shaped as `[num_tokens, num_topk]`,
                 only several top-k shapes are supported. `-1` indices (not selecting any expert) are supported.
             num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
             num_experts: the number of all experts.
@@ -636,7 +636,7 @@ class Buffer:
         Arguments:
             x: `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`,
                 the local calculated tokens to be sent to this original rank and reduced.
-            topk_idx: `[num_combined_tokens, num_topk]` with `deep_ep.topk_idx_t` (typically `torch.int64`), the expert
+            topk_idx: `[num_combined_tokens, num_topk]` with `deep_ep_ring.topk_idx_t` (typically `torch.int64`), the expert
                 indices selected by the dispatched tokens. `-1` indices (not selecting any expert) are supported. Note that,
                 `num_combined_tokens` equals to the number of dispatched tokens.
             topk_weights: `[num_combined_tokens, num_topk]` with `torch.float`, the expert weights selected by the dispatched

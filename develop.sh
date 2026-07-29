@@ -11,7 +11,7 @@ python setup.py build
 # Find the .so file in build directory and create symlink in current directory
 so_file=$(find build -name "*.so" -type f | head -n 1)
 if [ -n "$so_file" ]; then
-    ln -sf "../$so_file" deep_ep/
+    ln -sf "../$so_file" deep_ep_ring/
 else
     echo "Error: No SO file found in build directory" >&2
     exit 1

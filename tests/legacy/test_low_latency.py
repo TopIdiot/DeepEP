@@ -5,10 +5,10 @@ import torch.distributed as dist
 from functools import partial
 from typing import Literal, Set
 
-import deep_ep
-from deep_ep.utils.envs import init_dist
-from deep_ep.utils.math import calc_diff, per_token_cast_back, hash_tensor
-from deep_ep.utils.testing import bench, bench_kineto
+import deep_ep_ring
+from deep_ep_ring.utils.envs import init_dist
+from deep_ep_ring.utils.math import calc_diff, per_token_cast_back, hash_tensor
+from deep_ep_ring.utils.testing import bench, bench_kineto
 
 
 def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "clean"], expected_masked_ranks: Set[int]):
@@ -30,7 +30,7 @@ def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "cl
     return False
 
 
-def query_mask_buffer_and_check(api: Literal["dispatch", "combine", "clean"], buffer: deep_ep.Buffer, mask_status: torch.Tensor,
+def query_mask_buffer_and_check(api: Literal["dispatch", "combine", "clean"], buffer: deep_ep_ring.Buffer, mask_status: torch.Tensor,
                                 expected_masked_ranks: Set[int]):
     buffer.low_latency_query_mask_buffer(mask_status)
     assert set(mask_status.nonzero().squeeze(-1).tolist()) == expected_masked_ranks
@@ -43,7 +43,7 @@ def test_main(num_tokens: int,
               rank: int,
               num_ranks: int,
               group: dist.ProcessGroup,
-              buffer: deep_ep.Buffer,
+              buffer: deep_ep_ring.Buffer,
               use_logfmt: bool = False,
               shrink_test: bool = False,
               seed: int = 0):
@@ -69,7 +69,7 @@ def test_main(num_tokens: int,
 
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+    topk_idx = topk_idx.to(deep_ep_ring.topk_idx_t)
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
 
     # Randomly mask some positions
@@ -257,10 +257,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
 
-    num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
+    num_rdma_bytes = deep_ep_ring.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
-    buffer = deep_ep.Buffer(group,
+    buffer = deep_ep_ring.Buffer(group,
                             num_rdma_bytes=num_rdma_bytes,
                             low_latency_mode=True,
                             num_qps_per_rank=num_experts // num_ranks,

@@ -1,7 +1,7 @@
 import torch
 
-from deep_ep.utils.math import ceil_div
-from deep_ep.utils.gate import get_unbalanced_scores
+from deep_ep_ring.utils.math import ceil_div
+from deep_ep_ring.utils.gate import get_unbalanced_scores
 
 
 def test_unbalanced_scores():

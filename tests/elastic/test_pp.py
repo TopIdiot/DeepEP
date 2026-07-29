@@ -5,9 +5,9 @@ import random
 import torch
 import torch.distributed as dist
 
-import deep_ep
-from deep_ep.utils.envs import init_dist, dist_print, get_rdma_gbs
-from deep_ep.utils.testing import bench_kineto
+import deep_ep_ring
+from deep_ep_ring.utils.envs import init_dist, dist_print, get_rdma_gbs
+from deep_ep_ring.utils.testing import bench_kineto
 
 
 def generate_stress_ops(rank_idx: int, num_ranks: int, num_sends: int, shape: tuple):
@@ -44,9 +44,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     shape = (args.num_tokens, args.hidden)
     num_max_tensor_bytes = math.prod(shape) * 2
     num_max_inflight_tensors = args.num_max_inflight_tensors
-    buffer = deep_ep.ElasticBuffer(
+    buffer = deep_ep_ring.ElasticBuffer(
         group, explicitly_destroy=True, allow_hybrid_mode=False,
-        num_bytes=deep_ep.ElasticBuffer.get_pp_buffer_size_hint(
+        num_bytes=deep_ep_ring.ElasticBuffer.get_pp_buffer_size_hint(
             num_max_tensor_bytes, num_max_inflight_tensors))
     buffer.pp_set_config(num_max_tensor_bytes, num_max_inflight_tensors)
 

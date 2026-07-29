@@ -12,8 +12,8 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 current_dir = os.path.dirname(os.path.realpath(__file__))
 persistent_env_names = ('EP_JIT_CACHE_DIR', 'EP_JIT_PRINT_COMPILER_COMMAND', 'EP_NUM_TOPK_IDX_BITS', 'EP_NCCL_ROOT_DIR')
 
-# Load discover module without triggering `deep_ep.__init__`
-find_pkgs_spec = importlib.util.spec_from_file_location('find_pkgs', os.path.join(current_dir, 'deep_ep', 'utils', 'find_pkgs.py'))
+# Load discover module without triggering `deep_ep_ring.__init__`
+find_pkgs_spec = importlib.util.spec_from_file_location('find_pkgs', os.path.join(current_dir, 'deep_ep_ring', 'utils', 'find_pkgs.py'))
 find_pkgs = importlib.util.module_from_spec(find_pkgs_spec)
 find_pkgs_spec.loader.exec_module(find_pkgs)
 
@@ -48,7 +48,7 @@ def get_nccl_lib_name(base_dir):
 
 
 def get_package_version():
-    with open(Path(current_dir) / 'deep_ep' / '__init__.py', 'r') as f:
+    with open(Path(current_dir) / 'deep_ep_ring' / '__init__.py', 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
 
@@ -83,9 +83,9 @@ class CustomBuildPy(build_py):
             code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
 
         # Create temporary build directory
-        build_include_dir = os.path.join(self.build_lib, 'deep_ep')
+        build_include_dir = os.path.join(self.build_lib, 'deep_ep_ring')
         os.makedirs(build_include_dir, exist_ok=True)
-        with open(os.path.join(self.build_lib, 'deep_ep', 'envs.py'), 'w') as f:
+        with open(os.path.join(self.build_lib, 'deep_ep_ring', 'envs.py'), 'w') as f:
             f.write(code)
 
 
@@ -98,7 +98,7 @@ if __name__ == '__main__':
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
     sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
-    include_dirs = [f'{current_dir}/deep_ep/include',
+    include_dirs = [f'{current_dir}/deep_ep_ring/include',
                     f'{current_dir}/third-party/fmt/include',
                     '/usr/local/cuda/include/cccl']
     library_dirs = []
@@ -195,16 +195,16 @@ if __name__ == '__main__':
     print()
 
     setuptools.setup(
-        name='deep_ep',
+        name='deep-ep-ring',
         version=get_package_version(),
-        packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
+        packages=setuptools.find_packages(include=['deep_ep_ring', 'deep_ep_ring.*']),
         package_data={
-            'deep_ep': [
+            'deep_ep_ring': [
                 'include/deep_ep/**/*',
             ]
         },
         ext_modules=[
-            CUDAExtension(name='deep_ep._C',
+            CUDAExtension(name='deep_ep_ring._C',
                           include_dirs=include_dirs,
                           library_dirs=library_dirs,
                           sources=sources,

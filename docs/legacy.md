@@ -58,10 +58,8 @@ DeepEP V1 depends on NVSHMEM. Please refer to the NVSHMEM Installation Guide for
 ### Development
 
 ```bash
-# Build and make symbolic links for SO files
-NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
-# You may modify the specific SO names according to your own platform
-ln -s build/lib.linux-x86_64-cpython-38/deep_ep_cpp.cpython-38-x86_64-linux-gnu.so
+# Build and link the extension into deep_ep_ring/
+NVSHMEM_DIR=/path/to/installed/nvshmem ./develop.sh
 
 # Run test cases
 # NOTES: you may modify the `init_dist` function in `tests/utils.py`
@@ -122,7 +120,7 @@ import torch
 import torch.distributed as dist
 from typing import List, Tuple, Optional, Union
 
-from deep_ep import Buffer, EventOverlap
+from deep_ep_ring import Buffer, EventOverlap
 
 # Communication buffer (will allocate at runtime)
 _buffer: Optional[Buffer] = None
@@ -235,7 +233,7 @@ import torch
 import torch.distributed as dist
 from typing import Tuple, Optional
 
-from deep_ep import Buffer
+from deep_ep_ring import Buffer
 
 # Communication buffer (will allocate at runtime)
 # NOTES: there is no SM control API for the low-latency kernels

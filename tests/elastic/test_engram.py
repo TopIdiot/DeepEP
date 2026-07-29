@@ -3,10 +3,10 @@ import os
 import torch
 import torch.distributed as dist
 
-import deep_ep
-from deep_ep.utils.envs import init_dist, dist_print
-from deep_ep.utils.math import per_token_cast_to_fp8
-from deep_ep.utils.testing import bench_kineto
+import deep_ep_ring
+from deep_ep_ring.utils.envs import init_dist, dist_print
+from deep_ep_ring.utils.math import per_token_cast_to_fp8
+from deep_ep_ring.utils.testing import bench_kineto
 
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
@@ -14,7 +14,7 @@ from deep_ep.utils.testing import bench_kineto
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     dtype = torch.float8_e4m3fn if args.use_fp8 else torch.bfloat16
-    num_gpu_bytes, num_cpu_bytes = deep_ep.ElasticBuffer.get_engram_storage_size_hint(
+    num_gpu_bytes, num_cpu_bytes = deep_ep_ring.ElasticBuffer.get_engram_storage_size_hint(
         args.num_entries, args.hidden, args.num_tokens * args.num_entries_per_token, dtype)
 
     # 1 QP uses 1 SM
@@ -30,7 +30,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                f' > Tokens to fetch: {args.num_tokens} x {args.num_entries_per_token} entries\n'
                f' > Storage per rank: {args.num_entries * args.hidden * dtype.itemsize / 1024 / 1024:.1f} MB\n',
                once_in_node=True)
-    buffer = deep_ep.ElasticBuffer(
+    buffer = deep_ep_ring.ElasticBuffer(
         group,
         num_bytes=num_gpu_bytes + num_cpu_bytes, num_cpu_bytes=num_cpu_bytes,
         explicitly_destroy=True, num_allocated_qps=num_qps,

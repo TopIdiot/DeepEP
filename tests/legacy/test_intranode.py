@@ -4,17 +4,17 @@ import torch
 import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
-import deep_ep
-from deep_ep.utils.envs import init_dist
-from deep_ep.utils.math import calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
-from deep_ep.utils.testing import bench
+import deep_ep_ring
+from deep_ep_ring.utils.envs import init_dist
+from deep_ep_ring.utils.math import calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
+from deep_ep_ring.utils.testing import bench
 
 # Test compatibility with low latency functions
 import test_low_latency
 
 
 # noinspection PyShadowingNames
-def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: deep_ep.Buffer,
+def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: deep_ep_ring.Buffer,
               group: dist.ProcessGroup):
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
@@ -27,11 +27,11 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
+    x_e4m3 = per_token_cast_to_fp8(x) if deep_ep_ring.Buffer.is_sm90_compiled() else None
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+    topk_idx = topk_idx.to(deep_ep_ring.topk_idx_t)
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
     rank_idx = topk_idx // (num_experts // num_ranks)
@@ -75,7 +75,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
 
     # Config
     nvl_buffer_size = 256
-    config = deep_ep.Config(num_sms, 8, nvl_buffer_size)
+    config = deep_ep_ring.Config(num_sms, 8, nvl_buffer_size)
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -201,11 +201,11 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
         for nvl_chunk_size in tuple(range(4, 33, 2)) + (0, ):
             if nvl_chunk_size > 0:
-                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+                config = deep_ep_ring.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
             else:
                 # Test default config as well
-                deep_ep.Buffer.set_num_sms(num_sms)
-                config = deep_ep.Buffer.get_dispatch_config(num_ranks)
+                deep_ep_ring.Buffer.set_num_sms(num_sms)
+                config = deep_ep_ring.Buffer.get_dispatch_config(num_ranks)
             tune_args = {'x': current_x, 'handle': handle, 'config': config}
             t = bench(lambda: buffer.dispatch(**tune_args))[0]  # noqa: B023
             if t < best_time and nvl_chunk_size > 0:
@@ -227,7 +227,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
-    dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size)
+    dispatch_config = deep_ep_ring.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size)
 
     dispatch_args = {
         'x': x,
@@ -242,11 +242,11 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     best_time, best_results = 1e10, None
     for nvl_chunk_size in tuple(range(1, 17, 1)) + (0, ):
         if nvl_chunk_size > 0:
-            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+            config = deep_ep_ring.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
         else:
             # Test default config as well
-            deep_ep.Buffer.set_num_sms(num_sms)
-            config = deep_ep.Buffer.get_combine_config(num_ranks)
+            deep_ep_ring.Buffer.set_num_sms(num_sms)
+            config = deep_ep_ring.Buffer.get_combine_config(num_ranks)
         tune_args = {'x': recv_x, 'handle': handle, 'config': config}
         t = bench(lambda: buffer.combine(**tune_args))[0]  # noqa: B023
         if local_rank == 0:
@@ -270,9 +270,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     test_ll_compatibility, num_rdma_bytes = False, 0
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
-        num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(ll_num_tokens, ll_hidden, num_ranks, ll_num_experts)
+        num_rdma_bytes = deep_ep_ring.Buffer.get_low_latency_rdma_size_hint(ll_num_tokens, ll_hidden, num_ranks, ll_num_experts)
 
-    buffer = deep_ep.Buffer(group,
+    buffer = deep_ep_ring.Buffer(group,
                             int(2e9),
                             num_rdma_bytes,
                             low_latency_mode=test_ll_compatibility,
