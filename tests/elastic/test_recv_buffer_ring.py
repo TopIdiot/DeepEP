@@ -179,6 +179,19 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     invalid_cases = (
         dict(dispatch_recv_buffer_slot=0, async_with_compute_stream=True, allocate_on_comm_stream=False),
         dict(caller_managed_dispatch_recv_lifetime=True, async_with_compute_stream=True, allocate_on_comm_stream=False),
+        dict(caller_managed_dispatch_recv_compute_owner=True),
+        dict(
+            caller_managed_dispatch_recv_lifetime=True,
+            caller_managed_dispatch_recv_compute_owner=True,
+            async_with_compute_stream=False,
+            allocate_on_comm_stream=True,
+        ),
+        dict(
+            caller_managed_dispatch_recv_lifetime=True,
+            caller_managed_dispatch_recv_compute_owner=True,
+            async_with_compute_stream=True,
+            allocate_on_comm_stream=False,
+        ),
         dict(
             dispatch_recv_buffer_slot=0,
             caller_managed_dispatch_recv_lifetime=True,
@@ -259,8 +272,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     expected_sf_storage_bytes = aligned_capacity_tokens * num_sf_packs * cached_tma_payload[1].element_size()
     assert cached_tma["storage_bytes"][1] >= expected_sf_storage_bytes
 
-    # Exercise the fresh caller-managed policy and its required record_stream
-    # handoff with a delayed compute-stream reader.
+    # Exercise compute-owned fresh receive storage with a delayed reader. The
+    # allocator must preserve same-stream ordering without record_stream.
     caller_payload = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") + 32
     caller_reference, caller_reference_src_idx = reference_for(caller_payload, large_topk_idx)
     caller_recv, _, _, caller_handle, caller_event = buffer.dispatch(
@@ -274,16 +287,15 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         async_with_compute_stream=True,
         allocate_on_comm_stream=True,
         caller_managed_dispatch_recv_lifetime=True,
+        caller_managed_dispatch_recv_compute_owner=True,
     )
     caller_event.current_stream_wait()
     caller_num_valid, caller_expected = _check_dispatch(caller_recv, caller_handle, caller_reference, caller_reference_src_idx)
     caller_snapshot = enqueue_snapshot(caller_recv, caller_num_valid)
-    caller_recv.record_stream(torch.cuda.current_stream())
     del caller_recv
     gc.collect()
-    with torch.cuda.stream(buffer.get_comm_stream()):
-        caller_poison = torch.empty((world_size * num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        caller_poison.fill_(99)
+    caller_poison = torch.empty((world_size * num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    caller_poison.fill_(99)
 
     torch.cuda.synchronize()
     assert fp8_slot0["ptrs"] != fp8_slot1["ptrs"]

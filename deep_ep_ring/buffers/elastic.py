@@ -942,7 +942,8 @@ class ElasticBuffer:
                  do_zero_padding: bool = False,
                  use_tma_aligned_col_major_sf: bool = False,
                  dispatch_recv_buffer_slot: Optional[int] = None,
-                 caller_managed_dispatch_recv_lifetime: bool = False) \
+                 caller_managed_dispatch_recv_lifetime: bool = False,
+                 caller_managed_dispatch_recv_compute_owner: bool = False) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -999,6 +1000,14 @@ class ElasticBuffer:
                 both tensors alive and record every stream that reads them.
                 Asynchronous use requires ``allocate_on_comm_stream=True`` so
                 the communication producer remains the allocation owner.
+            caller_managed_dispatch_recv_compute_owner: allocate only ``recv_x``
+                and its scale tensor on the caller's compute stream while the
+                remaining dispatch temporaries stay communication-stream owned.
+                DeepEP records an allocation-ready event and waits for it only
+                before the copy epilogue writes those tensors. This makes the
+                final compute-stream reader allocator-safe without
+                ``record_stream``. Requires caller-managed lifetime,
+                asynchronous execution, and ``allocate_on_comm_stream=True``.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
@@ -1061,6 +1070,13 @@ class ElasticBuffer:
                 raise ValueError(
                     "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream"
                 )
+        if caller_managed_dispatch_recv_compute_owner:
+            if not caller_managed_dispatch_recv_lifetime:
+                raise ValueError("Compute-owned dispatch receive storage requires caller-managed lifetime")
+            if not async_with_compute_stream or not allocate_on_comm_stream:
+                raise ValueError(
+                    "Compute-owned dispatch receive storage requires asynchronous communication-stream dispatch"
+                )
 
         # Do dispatch
         (recv_x, recv_sf,
@@ -1097,7 +1113,8 @@ class ElasticBuffer:
                                         do_zero_padding,
                                         use_tma_aligned_col_major_sf,
                                         dispatch_recv_buffer_slot,
-                                        caller_managed_dispatch_recv_lifetime)
+                                        caller_managed_dispatch_recv_lifetime,
+                                        caller_managed_dispatch_recv_compute_owner)
 
         # Create handle
         is_cached_dispatch = handle is not None

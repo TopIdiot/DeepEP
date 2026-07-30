@@ -828,7 +828,8 @@ public:
              const bool& do_expand, const bool& do_zero_padding,
              const bool& use_tma_aligned_col_major_sf,
              const std::optional<int>& dispatch_recv_buffer_slot,
-             const bool& caller_managed_dispatch_recv_lifetime) {
+             const bool& caller_managed_dispatch_recv_lifetime,
+             const bool& caller_managed_dispatch_recv_compute_owner) {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -907,6 +908,10 @@ public:
         EP_HOST_ASSERT((not caller_managed_dispatch_recv_lifetime or
                         not async_with_compute_stream or allocate_on_comm_stream) and
                        "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream");
+        EP_HOST_ASSERT((not caller_managed_dispatch_recv_compute_owner or
+                        (caller_managed_dispatch_recv_lifetime and async_with_compute_stream and
+                         allocate_on_comm_stream and not reuse_dispatch_recv_buffer)) and
+                       "Compute-owned dispatch receive storage requires fresh caller-managed asynchronous dispatch");
         if (reuse_dispatch_recv_buffer) {
             EP_HOST_ASSERT(dispatch_recv_buffer_slot.value() >= 0 and
                            dispatch_recv_buffer_slot.value() < num_dispatch_recv_buffer_slots and
@@ -1213,6 +1218,8 @@ public:
         auto recv_x = torch::Tensor();
         auto recv_sf = std::optional<torch::Tensor>();
         DispatchRecvBufferSlot* reusable_slot = nullptr;
+        if (caller_managed_dispatch_recv_compute_owner)
+            at::cuda::setCurrentCUDAStream(compute_stream);
         if (reuse_dispatch_recv_buffer) {
             const auto ring_key = DispatchRecvBufferKey{
                 static_cast<int64_t>(x.scalar_type()),
@@ -1285,6 +1292,16 @@ public:
             }
             recv_sf_ptr = recv_sf->data_ptr();
         }
+        auto dispatch_recv_allocation_ready = std::optional<EventHandle>();
+        if (caller_managed_dispatch_recv_compute_owner) {
+            // The caching allocator may return storage whose previous reader
+            // is still queued on the compute stream.  Keep all other dispatch
+            // allocations communication-stream owned, but order the copy
+            // epilogue after this precise allocation-owner tail before it
+            // writes recv_x/recv_sf.
+            dispatch_recv_allocation_ready = EventHandle(compute_stream);
+            at::cuda::setCurrentCUDAStream(comm_stream);
+        }
         if (not do_expand) {
             recv_topk_idx = torch::empty({num_allocated_tokens, num_topk}, topk_idx.options());
             recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
@@ -1311,6 +1328,8 @@ public:
         // Launch copy kernels with full SMs
         if (not reuse_dispatch_recv_buffer)
             stream_control_before_epilogue(previous_event_before_epilogue);
+        if (dispatch_recv_allocation_ready.has_value())
+            stream_wait(comm_stream, dispatch_recv_allocation_ready.value());
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
