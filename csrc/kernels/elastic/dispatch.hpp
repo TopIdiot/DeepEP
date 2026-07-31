@@ -246,7 +246,7 @@ class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopy
 public:
     struct Args {
         // Templated arguments
-        bool do_expand, cached_mode, do_zero_padding, do_direct_permute;
+        bool do_expand, cached_mode, do_zero_padding;
         int num_channels;
         int num_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
@@ -263,8 +263,6 @@ public:
         int* recv_src_metadata;
         int* channel_linked_list;
         int* num_unaligned_recv_tokens_per_expert;
-        const int* direct_permute_cumulated_multihot;
-        const int* direct_permute_cu_seqlens;
         int num_recv_tokens;
         int recv_sf_token_stride, recv_sf_hidden_stride;
         int scaleout_rank_idx, scaleup_rank_idx;
@@ -279,10 +277,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
-                           args.do_expand, args.cached_mode, args.do_zero_padding, args.do_direct_permute,
+                           args.do_expand, args.cached_mode, args.do_zero_padding,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
@@ -299,8 +297,6 @@ static void __instantiate_kernel() {{
                                                  args.recv_src_metadata,
                                                  args.channel_linked_list,
                                                  args.num_unaligned_recv_tokens_per_expert,
-                                                 args.direct_permute_cumulated_multihot,
-                                                 args.direct_permute_cu_seqlens,
                                                  args.num_recv_tokens,
                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
                                                  args.scaleout_rank_idx, args.scaleup_rank_idx));
@@ -315,8 +311,6 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           int* recv_src_metadata,
                                           int* channel_linked_list,
                                           int* num_unaligned_recv_tokens_per_expert,
-                                          const int* direct_permute_cumulated_multihot,
-                                          const int* direct_permute_cu_seqlens,
                                           const int& num_recv_tokens, const int& num_max_tokens_per_rank,
                                           const int& num_hidden_bytes,
                                           const int& num_sf_packs, const int& recv_sf_token_stride, const int& recv_sf_hidden_stride,
@@ -326,7 +320,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_sms, const int& num_smem_bytes,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
-                                          const bool& do_zero_padding, const bool& do_direct_permute,
+                                          const bool& do_zero_padding,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -336,7 +330,6 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
         .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding,
-        .do_direct_permute = do_direct_permute,
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,
@@ -350,8 +343,6 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .recv_src_metadata = recv_src_metadata,
         .channel_linked_list = channel_linked_list,
         .num_unaligned_recv_tokens_per_expert = num_unaligned_recv_tokens_per_expert,
-        .direct_permute_cumulated_multihot = direct_permute_cumulated_multihot,
-        .direct_permute_cu_seqlens = direct_permute_cu_seqlens,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,

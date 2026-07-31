@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <map>
 #include <memory>
 #include <numeric>
 #include <tuple>
@@ -47,37 +46,6 @@ class ElasticBuffer {
 
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
-
-    struct DispatchRecvBufferSlot {
-        torch::Tensor recv_x;
-        std::optional<torch::Tensor> recv_sf;
-    };
-
-    struct DispatchRecvBufferKey {
-        int64_t x_dtype;
-        int64_t sf_dtype;
-        int64_t hidden;
-        int64_t num_sf_packs;
-        bool use_tma_aligned_col_major_sf;
-
-        bool operator<(const DispatchRecvBufferKey& other) const {
-            return std::tie(x_dtype, sf_dtype, hidden, num_sf_packs, use_tma_aligned_col_major_sf) <
-                   std::tie(other.x_dtype, other.sf_dtype, other.hidden, other.num_sf_packs,
-                            other.use_tma_aligned_col_major_sf);
-        }
-    };
-
-    // Reusable dispatch outputs are opt-in per call.  Rings are separated by
-    // every caller-visible storage-layout field so incompatible payloads never
-    // alias the same slot ID. The ElasticBuffer itself is bound to one device;
-    // the device predicates in must_replace are defensive invariant checks,
-    // not another key dimension.
-    // The caller supplies the slot index and an overwrite fence for that slot.
-    // Calls on one ElasticBuffer must remain single-threaded. The Python
-    // binding currently enforces that by retaining the GIL; add locking here
-    // before any binding starts releasing it around dispatch.
-    std::map<DispatchRecvBufferKey, std::vector<DispatchRecvBufferSlot>> dispatch_recv_buffer_rings;
-    int num_dispatch_recv_buffer_slots = 0;
 
     // Timeout settings
     int num_cpu_timeout_secs;
@@ -188,9 +156,6 @@ public:
         // Finish all works on all GPUs
         barrier(true, true);
 
-        // Release persistent receive slots while the runtime is known idle.
-        dispatch_recv_buffer_rings.clear();
-
         // Deallocate host workspaces
         CUDA_RUNTIME_CHECK(cudaFreeHost(host_workspace));
 
@@ -199,73 +164,6 @@ public:
 
         // Cannot use anymore
         destroyed = true;
-    }
-
-    void set_dispatch_recv_buffer_reuse(const int& num_slots) {
-        EP_HOST_ASSERT(not destroyed);
-        EP_HOST_ASSERT(num_slots >= 0);
-
-        // Shrinking may release comm-stream-owned storage, so first finish all
-        // producers and caller-recorded readers on this device. Growing only
-        // changes the accepted index range and does not allocate anything.
-        if (num_slots < num_dispatch_recv_buffer_slots) {
-            CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
-            if (num_slots == 0) {
-                dispatch_recv_buffer_rings.clear();
-            } else {
-                for (auto& [_, ring]: dispatch_recv_buffer_rings) {
-                    if (ring.size() > static_cast<size_t>(num_slots))
-                        ring.resize(num_slots);
-                }
-            }
-        }
-        num_dispatch_recv_buffer_slots = num_slots;
-    }
-
-    void release_dispatch_recv_buffers() {
-        EP_HOST_ASSERT(not destroyed);
-        CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
-        dispatch_recv_buffer_rings.clear();
-    }
-
-    void reserve_dispatch_recv_buffers(const torch::Tensor& x,
-                                       const std::optional<torch::Tensor>& sf,
-                                       const std::vector<int64_t>& slot_ids,
-                                       const int& num_max_tokens_per_rank,
-                                       const bool& use_tma_aligned_col_major_sf) {
-        EP_HOST_ASSERT(not destroyed);
-        EP_HOST_ASSERT(x.dim() == 2 and x.size(0) == 1 and x.is_contiguous());
-        EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
-        if (sf.has_value())
-            EP_HOST_ASSERT(sf->dim() == 2 and sf->size(0) == 1 and sf->is_contiguous() and
-                           sf->device() == x.device());
-        const auto hidden = x.size(1);
-        const auto num_sf_packs = sf.has_value() ? sf->size(1) : 0;
-        const auto ring_key = DispatchRecvBufferKey{
-            static_cast<int64_t>(x.scalar_type()),
-            sf.has_value() ? static_cast<int64_t>(sf->scalar_type()) : -1,
-            hidden,
-            num_sf_packs,
-            use_tma_aligned_col_major_sf};
-        auto& ring = dispatch_recv_buffer_rings[ring_key];
-        const auto num_storage_tokens =
-            static_cast<int64_t>(num_max_tokens_per_rank) * nccl_context->num_ranks;
-        for (const auto slot_id: slot_ids) {
-            EP_HOST_ASSERT(slot_id >= 0 and slot_id < num_dispatch_recv_buffer_slots);
-            if (ring.size() <= static_cast<size_t>(slot_id))
-                ring.resize(static_cast<size_t>(slot_id) + 1);
-            auto& slot = ring[static_cast<size_t>(slot_id)];
-            slot.recv_x = torch::empty({num_storage_tokens, hidden}, x.options());
-            if (sf.has_value()) {
-                const int64_t num_storage_elements = static_cast<int64_t>(num_sf_packs) *
-                    (use_tma_aligned_col_major_sf
-                         ? math::align<int64_t>(num_storage_tokens, kNumAlignedSFPacks)
-                         : num_storage_tokens);
-                slot.recv_sf = torch::empty({num_storage_elements}, sf->options());
-            } else {
-                slot.recv_sf.reset();
-            }
-        }
     }
 
     torch::Stream get_comm_stream() const {
@@ -651,11 +549,6 @@ public:
         return compute_stream;
     }
 
-    void stream_control_before_epilogue(const std::optional<EventHandle>& previous_event_before_epilogue) const {
-        if (previous_event_before_epilogue.has_value())
-            stream_wait(comm_stream, previous_event_before_epilogue.value());
-    }
-
     std::optional<EventHandle> stream_control_epilogue(const std::vector<std::optional<torch::Tensor>>& tensors,
                                                        const at::cuda::CUDAStream& compute_stream,
                                                        const bool& allocate_on_comm_stream,
@@ -801,7 +694,7 @@ public:
                torch::Tensor, torch::Tensor, torch::Tensor,
                torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<EventHandle>, std::optional<EventHandle>>
+               std::optional<EventHandle>>
     dispatch(const torch::Tensor& x,
              const std::optional<torch::Tensor>& sf,
              const torch::Tensor& topk_idx,
@@ -821,19 +714,14 @@ public:
              const int& num_experts, const int& expert_alignment,
              const int& num_sms, const int& num_qps,
              const std::optional<EventHandle>& previous_event,
-             const std::optional<EventHandle>& previous_event_before_epilogue,
              const bool& async_with_compute_stream,
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync,
              const bool& do_expand, const bool& do_zero_padding,
              const bool& use_tma_aligned_col_major_sf,
-             const std::optional<int>& dispatch_recv_buffer_slot,
+             const bool& caller_managed_dispatch_input_lifetime,
              const bool& caller_managed_dispatch_recv_lifetime,
-             const bool& caller_managed_dispatch_recv_compute_owner,
-             const bool& return_input_consumed_event,
-             const std::optional<torch::Tensor>& direct_permute_cumulated_multihot,
-             const std::optional<torch::Tensor>& direct_permute_cu_seqlens,
-             const std::optional<int>& direct_permute_output_rows) {
+             const bool& caller_managed_dispatch_recv_compute_owner) {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -906,50 +794,13 @@ public:
             cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
         }
 
-        const bool reuse_dispatch_recv_buffer = dispatch_recv_buffer_slot.has_value();
-        const bool do_direct_permute = direct_permute_cumulated_multihot.has_value();
-        EP_HOST_ASSERT(do_direct_permute == direct_permute_cu_seqlens.has_value() and
-                       do_direct_permute == direct_permute_output_rows.has_value() and
-                       "Direct permute requires both metadata tensors and output rows");
-        if (do_direct_permute) {
-            const auto [direct_num_tokens, direct_num_local_experts] =
-                get_shape<2>(direct_permute_cumulated_multihot.value());
-            const auto [direct_num_cu_seqlens] = get_shape<1>(direct_permute_cu_seqlens.value());
-            EP_HOST_ASSERT(cached_mode and not do_expand and not sf.has_value() and
-                           "Direct permute requires cached BF16 non-expanded dispatch");
-            EP_HOST_ASSERT(direct_num_tokens >= cached_num_recv_tokens.value() and
-                           direct_num_local_experts == num_local_experts and
-                           direct_num_cu_seqlens == num_local_experts + 1);
-            EP_HOST_ASSERT(direct_permute_cumulated_multihot->is_cuda() and
-                           direct_permute_cumulated_multihot->is_contiguous() and
-                           direct_permute_cumulated_multihot->scalar_type() == torch::kInt);
-            EP_HOST_ASSERT(direct_permute_cu_seqlens->is_cuda() and
-                           direct_permute_cu_seqlens->is_contiguous() and
-                           direct_permute_cu_seqlens->scalar_type() == torch::kInt);
-            EP_HOST_ASSERT(direct_permute_output_rows.value() > 0);
-        }
-        EP_HOST_ASSERT(not (reuse_dispatch_recv_buffer and caller_managed_dispatch_recv_lifetime) and
-                       "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive");
         EP_HOST_ASSERT((not caller_managed_dispatch_recv_lifetime or
                         not async_with_compute_stream or allocate_on_comm_stream) and
                        "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream");
         EP_HOST_ASSERT((not caller_managed_dispatch_recv_compute_owner or
                         (caller_managed_dispatch_recv_lifetime and async_with_compute_stream and
-                         allocate_on_comm_stream and not reuse_dispatch_recv_buffer)) and
+                         allocate_on_comm_stream)) and
                        "Compute-owned dispatch receive storage requires fresh caller-managed asynchronous dispatch");
-        if (reuse_dispatch_recv_buffer) {
-            EP_HOST_ASSERT(dispatch_recv_buffer_slot.value() >= 0 and
-                           dispatch_recv_buffer_slot.value() < num_dispatch_recv_buffer_slots and
-                           "Dispatch receive-buffer slot is outside the configured range");
-            EP_HOST_ASSERT(not do_cpu_sync and not do_expand and
-                           "Reusable dispatch recv buffers require a device-only, non-expanded dispatch");
-            EP_HOST_ASSERT((not async_with_compute_stream or allocate_on_comm_stream) and
-                           "Reusable asynchronous dispatch receive storage must be allocated on the communication stream");
-        }
-        EP_HOST_ASSERT(not (do_direct_permute and
-                            (reuse_dispatch_recv_buffer or caller_managed_dispatch_recv_lifetime)) and
-                       "Direct permute owns its expert-major receive allocation");
-
         // Stream control
         // All new tensor allocations should happen after this. Keep argument
         // validation above so a rejected call cannot leave the current stream
@@ -1158,14 +1009,6 @@ public:
                         cached_mode, do_cpu_sync,
                         comm_stream);
 
-        // The persistent communication body is the final reader of x/sf.
-        // Output allocation and the copy epilogue below do not access them, so
-        // a fixed input ring can safely reuse its slot behind this narrower
-        // fence instead of waiting for the whole dispatch operation.
-        auto input_consumed_event = std::optional<EventHandle>();
-        if (return_input_consumed_event)
-            input_consumed_event = EventHandle(comm_stream);
-
         // Received token counters
         int num_recv_tokens = 0, num_expanded_tokens = 0;
         int counter_scaleup_rank_idx = 0, counter_local_expert_idx = 0;
@@ -1236,54 +1079,12 @@ public:
 
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
-        const auto num_allocated_tokens = do_direct_permute ? direct_permute_output_rows.value() :
-            (do_expand ? num_expanded_tokens : num_recv_tokens);
-        // Cached dispatch reports the exact receive size from its forward
-        // handle.  A slot shared by many layers would otherwise grow every
-        // time it sees a larger handle, releasing the old storage before the
-        // caller's stream-ordered reader fence has executed.  Slot reuse is
-        // restricted to non-expanded dispatch, so reserve its known worst
-        // case once and only narrow the returned view to the exact size.
-        const auto num_reusable_storage_tokens = reuse_dispatch_recv_buffer
-            ? num_max_tokens_per_rank * nccl_context->num_ranks
-            : num_allocated_tokens;
-        // Wait only after the communication body has completed, immediately
-        // before storage for the chosen slot may be replaced or overwritten.
-        if (reuse_dispatch_recv_buffer)
-            stream_control_before_epilogue(previous_event_before_epilogue);
-
+        const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
         auto recv_x = torch::Tensor();
         auto recv_sf = std::optional<torch::Tensor>();
-        DispatchRecvBufferSlot* reusable_slot = nullptr;
         if (caller_managed_dispatch_recv_compute_owner)
             at::cuda::setCurrentCUDAStream(compute_stream);
-        if (reuse_dispatch_recv_buffer) {
-            const auto ring_key = DispatchRecvBufferKey{
-                static_cast<int64_t>(x.scalar_type()),
-                sf.has_value() ? static_cast<int64_t>(sf->scalar_type()) : -1,
-                hidden,
-                num_sf_packs,
-                use_tma_aligned_col_major_sf};
-
-            auto& ring = dispatch_recv_buffer_rings[ring_key];
-            const auto slot_idx = static_cast<size_t>(dispatch_recv_buffer_slot.value());
-            if (ring.size() <= slot_idx)
-                ring.resize(slot_idx + 1);
-            reusable_slot = &ring[slot_idx];
-
-            const bool must_replace =
-                not reusable_slot->recv_x.defined() or
-                reusable_slot->recv_x.scalar_type() != x.scalar_type() or
-                reusable_slot->recv_x.device() != x.device() or
-                reusable_slot->recv_x.size(1) != hidden or
-                reusable_slot->recv_x.size(0) < num_reusable_storage_tokens or
-                not reusable_slot->recv_x.is_contiguous();
-            if (must_replace)
-                reusable_slot->recv_x = torch::empty({num_reusable_storage_tokens, hidden}, x.options());
-            recv_x = reusable_slot->recv_x.narrow(0, 0, num_allocated_tokens).detach();
-        } else {
-            recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
-        }
+        recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
         auto recv_topk_idx = std::optional<torch::Tensor>();
         auto recv_topk_weights = std::optional<torch::Tensor>();
         auto recv_src_metadata = cached_mode ?
@@ -1300,33 +1101,11 @@ public:
             if (not use_tma_aligned_col_major_sf) {
                 recv_sf_token_stride = num_sf_packs, recv_sf_hidden_stride = 1;
             } else {
-                // Preserve the public logical layout even when the reusable
-                // backing storage reserves more rows than this returned view.
                 recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_allocated_tokens, kNumAlignedSFPacks);
             }
-            if (reuse_dispatch_recv_buffer) {
-                EP_HOST_ASSERT(reusable_slot != nullptr);
-                const int64_t num_storage_elements = static_cast<int64_t>(num_sf_packs) *
-                    (use_tma_aligned_col_major_sf
-                         ? math::align(num_reusable_storage_tokens, kNumAlignedSFPacks)
-                         : num_reusable_storage_tokens);
-                const bool must_replace =
-                    not reusable_slot->recv_sf.has_value() or
-                    reusable_slot->recv_sf->scalar_type() != sf->scalar_type() or
-                    reusable_slot->recv_sf->device() != sf->device() or
-                    reusable_slot->recv_sf->dim() != 1 or
-                    reusable_slot->recv_sf->numel() < num_storage_elements or
-                    not reusable_slot->recv_sf->is_contiguous();
-                if (must_replace)
-                    reusable_slot->recv_sf = torch::empty({num_storage_elements}, sf->options());
-                recv_sf = reusable_slot->recv_sf->as_strided(
-                    {num_allocated_tokens, num_sf_packs},
-                    {recv_sf_token_stride, recv_sf_hidden_stride}).detach();
-            } else {
-                recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
-                                               {recv_sf_token_stride, recv_sf_hidden_stride},
-                                               sf->options());
-            }
+            recv_sf = torch::empty_strided({num_allocated_tokens, num_sf_packs},
+                                           {recv_sf_token_stride, recv_sf_hidden_stride},
+                                           sf->options());
             recv_sf_ptr = recv_sf->data_ptr();
         }
         auto dispatch_recv_allocation_ready = std::optional<EventHandle>();
@@ -1340,8 +1119,7 @@ public:
             at::cuda::setCurrentCUDAStream(comm_stream);
         }
         if (not do_expand) {
-            recv_topk_idx = torch::empty({do_direct_permute ? num_recv_tokens : num_allocated_tokens, num_topk},
-                                         topk_idx.options());
+            recv_topk_idx = torch::empty({num_allocated_tokens, num_topk}, topk_idx.options());
             recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
         }
         if (topk_weights.has_value()) {
@@ -1364,8 +1142,6 @@ public:
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
         // Launch copy kernels with full SMs
-        if (not reuse_dispatch_recv_buffer)
-            stream_control_before_epilogue(previous_event_before_epilogue);
         if (dispatch_recv_allocation_ready.has_value())
             stream_wait(comm_stream, dispatch_recv_allocation_ready.value());
         launch_dispatch_copy_epilogue(buffer, workspace,
@@ -1376,8 +1152,6 @@ public:
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
                                       num_unaligned_recv_tokens_per_expert_ptr,
-                                      do_direct_permute ? direct_permute_cumulated_multihot->data_ptr<int>() : nullptr,
-                                      do_direct_permute ? direct_permute_cu_seqlens->data_ptr<int>() : nullptr,
                                       num_recv_tokens, num_max_tokens_per_rank,
                                       num_hidden_bytes,
                                       num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
@@ -1389,19 +1163,23 @@ public:
                                       num_channels,
                                       do_expand, cached_mode,
                                       do_zero_padding,
-                                      do_direct_permute,
                                       comm_stream);
 
         // Stream control
         const auto event = stream_control_epilogue(
-            {x, sf, topk_idx, topk_weights,
-             // Reusable storage is protected by the caller's slot fence;
-             // caller-managed fresh storage is explicitly recorded on its
-             // final-reader stream. In either case DeepEP must not add the
-             // broader compute-stream lifetime below.
-             (reuse_dispatch_recv_buffer or caller_managed_dispatch_recv_lifetime)
+            {caller_managed_dispatch_input_lifetime
+                 ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(x),
+             caller_managed_dispatch_input_lifetime
+                 ? std::optional<torch::Tensor>() : sf,
+             caller_managed_dispatch_input_lifetime
+                 ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(topk_idx),
+             caller_managed_dispatch_input_lifetime
+                 ? std::optional<torch::Tensor>() : topk_weights,
+             // Caller-managed fresh storage is recorded on its final-reader
+             // stream, so DeepEP must not add a broader compute lifetime.
+             caller_managed_dispatch_recv_lifetime
                  ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(recv_x),
-             (reuse_dispatch_recv_buffer or caller_managed_dispatch_recv_lifetime)
+             caller_managed_dispatch_recv_lifetime
                  ? std::optional<torch::Tensor>() : recv_sf,
              recv_topk_idx, recv_topk_weights,
              cumulative_local_expert_recv_stats,
@@ -1412,9 +1190,7 @@ public:
              recv_src_metadata,
              dst_buffer_slot_idx,
              token_metadata_at_forward,
-             channel_linked_list,
-             direct_permute_cumulated_multihot,
-             direct_permute_cu_seqlens},
+             channel_linked_list},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
@@ -1430,12 +1206,11 @@ public:
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
                 channel_linked_list,
-                event,
-                input_consumed_event};
+                event};
     }
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
-               std::optional<EventHandle>, std::optional<EventHandle>>
+               std::optional<EventHandle>>
     combine(const torch::Tensor& x,
             const std::optional<torch::Tensor>& topk_weights,
             const std::optional<torch::Tensor>& bias_0,
@@ -1449,11 +1224,9 @@ public:
             const int& num_max_tokens_per_rank,
             const int& num_sms, const int& num_qps,
             const std::optional<EventHandle>& previous_event,
-            const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
             const bool& use_expanded_layout,
-            const bool& return_input_consumed_event,
             const bool& caller_managed_combine_input_lifetime,
             const bool& caller_managed_combine_output_compute_owner) const {
         // Check SM count
@@ -1564,12 +1337,6 @@ public:
             use_expanded_layout, allow_multiple_reduction,
             comm_stream);
 
-        // launch_combine is the final reader of x/topk_weights. The reduce
-        // epilogue only consumes the communication buffer and dispatch handle.
-        auto input_consumed_event = std::optional<EventHandle>();
-        if (return_input_consumed_event)
-            input_consumed_event = EventHandle(comm_stream);
-
         // Combine outputs are consumed only on the compute stream. In
         // caller-managed mode, allocate them there and publish the allocation
         // tail to the communication stream immediately before its epilogue
@@ -1596,7 +1363,6 @@ public:
         }
 
         // Combine pushed data
-        stream_control_before_epilogue(previous_event_before_epilogue);
         if (combine_output_allocation_ready.has_value())
             stream_wait(comm_stream, combine_output_allocation_ready.value());
         launch_combine_reduce_epilogue(combined_x.data_ptr(),
@@ -1632,7 +1398,7 @@ public:
              channel_linked_list},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
-        return {combined_x, combined_topk_weights, event, input_consumed_event};
+        return {combined_x, combined_topk_weights, event};
     }
 };
 
@@ -1640,9 +1406,6 @@ static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
         .def("destroy", &ElasticBuffer::destroy)
-        .def("set_dispatch_recv_buffer_reuse", &ElasticBuffer::set_dispatch_recv_buffer_reuse)
-        .def("reserve_dispatch_recv_buffers", &ElasticBuffer::reserve_dispatch_recv_buffers)
-        .def("release_dispatch_recv_buffers", &ElasticBuffer::release_dispatch_recv_buffers)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)

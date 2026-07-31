@@ -361,10 +361,6 @@ class ElasticBuffer:
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
 
-        # Zero keeps the upstream allocation behavior.  A caller that owns the
-        # recv_x consumption fences may opt into a bounded reusable ring.
-        self._dispatch_recv_buffer_reuse_slots = 0
-
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
         group.barrier()
@@ -549,72 +545,6 @@ class ElasticBuffer:
         """
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
-
-    def set_dispatch_recv_buffer_reuse(self, num_slots: int) -> None:
-        """Enable caller-managed dispatch receive-buffer slots.
-
-        Before reusing a slot, callers must order the copy epilogue after the
-        previous output's last read.  They may either merge that local fence
-        into the normal ``previous_event`` (which waits at communication
-        prologue), or pass ``previous_event_before_epilogue``.  The former is
-        preferable when the final reader belongs to the caller's main compute
-        stream because it does not insert a distinct retire dependency into
-        the middle of DeepEP's shared communication stream.
-
-        Slot selection is explicit so callers can keep independent rings for
-        different lifetimes while the C++ runtime separates dtype, hidden
-        size, scale-factor width, and scale-factor layouts. Returned tensors
-        are overwritten when their slot is reused; raw communication-kernel
-        writes do not bump PyTorch version counters, so callers must not retain
-        or save a view past its published final-reader fence.
-
-        Reducing the configured slot count performs a blocking
-        ``cudaDeviceSynchronize()`` before releasing storage. Callers must do
-        that only at a device-wide quiescent point with no in-flight
-        peer-dependent communication. Increasing the count does not
-        synchronize or allocate storage.
-        """
-        if not isinstance(num_slots, int) or num_slots < 0:
-            raise ValueError("num_slots must be a nonnegative integer")
-        self.runtime.set_dispatch_recv_buffer_reuse(num_slots)
-        self._dispatch_recv_buffer_reuse_slots = num_slots
-
-    def release_dispatch_recv_buffers(self) -> None:
-        """Synchronize this device and release all persistent dispatch receive storage.
-
-        Configured slot indices remain enabled and will allocate fresh storage
-        on their next use. Use ``set_dispatch_recv_buffer_reuse(0)`` instead to
-        release the storage and disable slot reuse.
-
-        This method performs a blocking ``cudaDeviceSynchronize()``. Call it
-        only at a device-wide quiescent point with no in-flight peer-dependent
-        communication; otherwise synchronization may wait indefinitely for a
-        communication kernel whose peer has not progressed.
-        """
-        self.runtime.release_dispatch_recv_buffers()
-
-    def reserve_dispatch_recv_buffers(self,
-                                      payloads: Sequence[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]],
-                                      slot_ids: Sequence[int],
-                                      num_max_tokens_per_rank: Optional[int] = None) -> None:
-        """Allocate every reusable dispatch-output layout before scheduling.
-
-        ``payloads`` contain one-row representatives of the public BF16 or
-        FP8+scale layouts. The runtime expands them to the non-expanded receive
-        capacity on every selected slot without launching communication.
-        """
-        if self._dispatch_recv_buffer_reuse_slots <= 0:
-            raise RuntimeError("set_dispatch_recv_buffer_reuse must be called before reserve")
-        if not slot_ids or any(
-                not isinstance(slot, int) or not 0 <= slot < self._dispatch_recv_buffer_reuse_slots
-                for slot in slot_ids):
-            raise ValueError("slot_ids must be nonempty and inside the configured reusable range")
-        capacity = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
-        for payload in payloads:
-            x, sf = payload if isinstance(payload, tuple) else (payload, None)
-            if x.shape[0] != 1 or (sf is not None and sf.shape[0] != 1):
-                raise ValueError("reserve payload representatives must have exactly one row")
-            self.runtime.reserve_dispatch_recv_buffers(x, sf, list(slot_ids), capacity, False)
 
     def get_physical_domain_size(self) -> Tuple[int, int]:
         """
@@ -932,7 +862,6 @@ class ElasticBuffer:
                  expert_alignment: Optional[int] = None,
                  num_sms: int = 0, num_qps: int = 0,
                  previous_event: Optional[EventHandle] = None,
-                 previous_event_before_epilogue: Optional[EventHandle] = None,
                  async_with_compute_stream: bool = False,
                  allocate_on_comm_stream: bool = False,
                  handle: Optional[EPHandle] = None,
@@ -941,13 +870,9 @@ class ElasticBuffer:
                  do_expand: bool = False,
                  do_zero_padding: bool = False,
                  use_tma_aligned_col_major_sf: bool = False,
-                 dispatch_recv_buffer_slot: Optional[int] = None,
+                 caller_managed_dispatch_input_lifetime: bool = False,
                  caller_managed_dispatch_recv_lifetime: bool = False,
-                 caller_managed_dispatch_recv_compute_owner: bool = False,
-                 return_input_consumed_event: bool = False,
-                 direct_permute_cumulated_multihot: Optional[torch.Tensor] = None,
-                 direct_permute_cu_seqlens: Optional[torch.Tensor] = None,
-                 direct_permute_output_rows: Optional[int] = None) \
+                 caller_managed_dispatch_recv_compute_owner: bool = False) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -975,7 +900,6 @@ class ElasticBuffer:
             num_qps: the number of RDMA QPs to use (0 for automatic via `get_theoretical_num_qps`).
             previous_event: the event to wait before actually executing the kernel.
                 If set, `allocate_on_comm_stream` must also be `True`.
-            previous_event_before_epilogue: the event to wait before actually executing the copy epilogue.
             async_with_compute_stream: the current stream will not wait for the communication kernels to be
                 finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the
@@ -990,15 +914,11 @@ class ElasticBuffer:
             do_zero_padding: whether to zero out the alignment padding slots in the expanded output.
                 Only valid when `do_expand` is True. Ensures alignment gaps between experts are zeroed.
             use_tma_aligned_col_major_sf: whether to use TMA-aligned column-major layout for scale factors.
-            dispatch_recv_buffer_slot: optional caller-managed receive-buffer
-                slot. Requires ``set_dispatch_recv_buffer_reuse`` and a
-                device-only, non-expanded dispatch. Before a reused slot is
-                overwritten, its previous final reader must be covered by
-                either ``previous_event`` or ``previous_event_before_epilogue``.
-                Asynchronous use requires ``allocate_on_comm_stream=True``.
-                TMA-aligned scale-factor views retain the normal stride derived
-                from their logical received-token count, independent of the
-                reusable slot's backing capacity.
+            caller_managed_dispatch_input_lifetime: skip DeepEP's allocator
+                ``record_stream`` calls for ``x``, optional scale factors,
+                ``topk_idx``, and optional ``topk_weights``. The caller must
+                retain these inputs until the returned completion event has
+                been ordered onto their allocation stream.
             caller_managed_dispatch_recv_lifetime: skip DeepEP's ``record_stream``
                 calls for ``recv_x`` and its scale tensor. The caller must keep
                 both tensors alive and record every stream that reads them.
@@ -1012,19 +932,6 @@ class ElasticBuffer:
                 final compute-stream reader allocator-safe without
                 ``record_stream``. Requires caller-managed lifetime,
                 asynchronous execution, and ``allocate_on_comm_stream=True``.
-            return_input_consumed_event: also return an event recorded after
-                the persistent communication body has finished reading ``x``
-                (and its optional scale) but before the output copy epilogue.
-                This is intended for precise fixed-input-slot retirement.
-            direct_permute_cumulated_multihot: optional int32 device prefix
-                counts from the caller's forward permute. Cached BF16 dispatch
-                uses this together with ``direct_permute_cu_seqlens`` to write
-                the receive payload directly into expert-major order.
-            direct_permute_cu_seqlens: optional int32 device expert segment
-                boundaries for direct expert-major output.
-            direct_permute_output_rows: capacity row count of the direct
-                expert-major output. Required with the two metadata tensors.
-
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
             recv_topk_idx: received expert indices
@@ -1070,18 +977,7 @@ class ElasticBuffer:
         num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
-        if dispatch_recv_buffer_slot is not None:
-            if not 0 <= dispatch_recv_buffer_slot < self._dispatch_recv_buffer_reuse_slots:
-                raise ValueError("dispatch_recv_buffer_slot is outside the configured range")
-            if do_cpu_sync or do_expand:
-                raise ValueError("Reusable dispatch recv buffers require a device-only, non-expanded dispatch")
-            if async_with_compute_stream and not allocate_on_comm_stream:
-                raise ValueError(
-                    "Reusable asynchronous dispatch receive storage must be allocated on the communication stream"
-                )
         if caller_managed_dispatch_recv_lifetime:
-            if dispatch_recv_buffer_slot is not None:
-                raise ValueError("Reusable and caller-managed dispatch receive lifetimes are mutually exclusive")
             if async_with_compute_stream and not allocate_on_comm_stream:
                 raise ValueError(
                     "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream"
@@ -1093,17 +989,6 @@ class ElasticBuffer:
                 raise ValueError(
                     "Compute-owned dispatch receive storage requires asynchronous communication-stream dispatch"
                 )
-        direct_permute = direct_permute_cumulated_multihot is not None
-        if direct_permute != (direct_permute_cu_seqlens is not None):
-            raise ValueError("direct permute requires both cumulated_multihot and cu_seqlens")
-        if direct_permute != (direct_permute_output_rows is not None):
-            raise ValueError("direct permute requires an explicit output row capacity")
-        if direct_permute:
-            if handle is None or sf is not None or do_expand:
-                raise ValueError("direct permute requires cached BF16 non-expanded dispatch")
-            if dispatch_recv_buffer_slot is not None or caller_managed_dispatch_recv_lifetime:
-                raise ValueError("direct permute owns its expert-major receive allocation")
-
         # Do dispatch
         (recv_x, recv_sf,
          recv_topk_idx, recv_topk_weights,
@@ -1117,7 +1002,7 @@ class ElasticBuffer:
          dst_buffer_slot_idx,
          token_metadata_at_forward,
          channel_linked_list,
-         event, input_consumed_event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
+         event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
                                         cumulative_local_expert_recv_stats,
                                         cached_num_recv_tokens,
                                         cached_num_expanded_tokens,
@@ -1133,18 +1018,13 @@ class ElasticBuffer:
                                         num_experts, expert_alignment,
                                         num_sms, num_qps,
                                         previous_event,
-                                        previous_event_before_epilogue,
                                         async_with_compute_stream, allocate_on_comm_stream,
                                         do_handle_copy, do_cpu_sync, do_expand,
                                         do_zero_padding,
                                         use_tma_aligned_col_major_sf,
-                                        dispatch_recv_buffer_slot,
+                                        caller_managed_dispatch_input_lifetime,
                                         caller_managed_dispatch_recv_lifetime,
-                                        caller_managed_dispatch_recv_compute_owner,
-                                        return_input_consumed_event,
-                                        direct_permute_cumulated_multihot,
-                                        direct_permute_cu_seqlens,
-                                        direct_permute_output_rows)
+                                        caller_managed_dispatch_recv_compute_owner)
 
         # Create handle
         is_cached_dispatch = handle is not None
@@ -1182,8 +1062,6 @@ class ElasticBuffer:
 
         # Return
         result = (recv_x, recv_topk_idx, recv_topk_weights, handle, event_overlap)
-        if return_input_consumed_event:
-            return (*result, EventOverlap(input_consumed_event))
         return result
 
     @staticmethod
@@ -1204,10 +1082,8 @@ class ElasticBuffer:
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 num_sms: int = 0, num_qps: int = 0,
                 previous_event: EventHandle = None,
-                previous_event_before_epilogue: Optional[EventHandle] = None,
                 async_with_compute_stream: bool = False,
                 allocate_on_comm_stream: bool = False,
-                return_input_consumed_event: bool = False,
                 caller_managed_combine_input_lifetime: bool = False,
                 caller_managed_combine_output_compute_owner: bool = False) \
             -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
@@ -1226,14 +1102,10 @@ class ElasticBuffer:
             num_qps: the number of RDMA QPs to use (0 for automatic via `get_theoretical_num_qps`).
             previous_event: the event to wait before actually executing the kernel.
                 If set, `allocate_on_comm_stream` must also be `True`.
-            previous_event_before_epilogue: the event to wait before actually executing the reduce epilogue.
             async_with_compute_stream: the current stream will not wait for the communication kernels to be
                 finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the
                 communication stream.
-            return_input_consumed_event: also return an event recorded after
-                the persistent communication body has finished reading ``x``
-                and ``topk_weights`` but before the reduce epilogue.
             caller_managed_combine_input_lifetime: omit ``x`` and
                 ``topk_weights`` from DeepEP's allocator stream recording. The
                 caller must retain them until the returned completion event is
@@ -1256,7 +1128,7 @@ class ElasticBuffer:
         assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
 
         bias_0, bias_1 = ElasticBuffer._unpack_bias(bias)
-        combined_x, combined_topk_weights, event, input_consumed_event = \
+        combined_x, combined_topk_weights, event = \
             self.runtime.combine(x, topk_weights,
                                  bias_0, bias_1,
                                  handle.recv_src_metadata,
@@ -1268,14 +1140,10 @@ class ElasticBuffer:
                                  handle.num_max_tokens_per_rank,
                                  num_sms, num_qps,
                                  previous_event,
-                                 previous_event_before_epilogue,
                                  async_with_compute_stream,
                                  allocate_on_comm_stream,
                                  handle.do_expand,
-                                 return_input_consumed_event,
                                  caller_managed_combine_input_lifetime,
                                  caller_managed_combine_output_compute_owner)
         result = (combined_x, combined_topk_weights, EventOverlap(event))
-        if return_input_consumed_event:
-            return (*result, EventOverlap(input_consumed_event))
         return result

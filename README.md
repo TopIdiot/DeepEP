@@ -1,6 +1,6 @@
 # DeepEP Ring
 
-This branch packages the payload-ring-enabled DeepEP fork as
+This branch packages the Sync-Free DeepEP fork as
 `deep-ep-ring` / `deep_ep_ring` so it can be installed alongside the official
 `deep_ep` package. The native C++ namespace and installed header layout remain
 `deep_ep` for source compatibility.
