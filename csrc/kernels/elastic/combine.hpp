@@ -7,6 +7,7 @@
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+#include "direct_prologue_barrier.hpp"
 
 namespace deep_ep::elastic {
 
@@ -16,6 +17,7 @@ public:
         // Templated arguments
         bool is_scaleup_nvlink;
         bool use_expanded_layout, allow_multiple_reduction;
+        bool skip_prologue_barrier;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
@@ -46,7 +48,7 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "combine";
-            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.is_scaleup_nvlink,
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
@@ -56,7 +58,8 @@ public:
                                     args.num_max_tokens_per_rank,
                                     args.num_experts,
                                     args.num_topk,
-                                    args.num_qps, args.num_timeout_cycles);
+                                    args.num_qps, args.num_timeout_cycles,
+                                    args.skip_prologue_barrier);
         } else {
             header_name = "hybrid_combine";
             func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -149,10 +152,13 @@ static void* launch_combine(void* x,
 
     // Generate, build and launch
     const auto num_threads = num_warps * 32;
+    const bool split_prologue_barrier =
+        num_scaleout_ranks == 1 and get_env<int>("EP_SPLIT_DIRECT_PROLOGUE_BARRIER", 0) != 0;
     const CombineRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
+        .skip_prologue_barrier = split_prologue_barrier,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
@@ -173,6 +179,13 @@ static void* launch_combine(void* x,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };
+    if (split_prologue_barrier) {
+        launch_direct_prologue_barrier(
+            nccl_dev_comm, nccl_window, workspace,
+            scaleup_rank_idx, num_scaleup_ranks,
+            num_qps, num_timeout_cycles, is_scaleup_nvlink,
+            DirectPrologueBarrierKind::kCombine, stream);
+    }
     const auto code = CombineRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine", code);
     CombineRuntime::launch(runtime, args, stream);

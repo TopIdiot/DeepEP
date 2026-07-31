@@ -8,7 +8,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding, bool kDoDirectPermute,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -28,6 +28,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int* recv_src_metadata,
                             int* channel_linked_list,
                             int* num_unaligned_recv_tokens_per_expert,
+                            const int* direct_permute_cumulated_multihot,
+                            const int* direct_permute_cu_seqlens,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
                             const int scaleout_rank_idx, const int scaleup_rank_idx) {
@@ -112,7 +114,14 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         // Calculate target indices in the tensor
         constexpr int kMetadataStride = 2 + kNumTopk;
         int dst_tensor_idx = -1;
-        if (not kDoExpand and ptx::elect_one_sync()) {
+        if constexpr (kDoDirectPermute) {
+            if (dst_expert_idx >= 0) {
+                const auto preceding = i == 0 ? 0 :
+                    direct_permute_cumulated_multihot[
+                        static_cast<int64_t>(i - 1) * kNumExpertsPerRank + dst_expert_idx];
+                dst_tensor_idx = direct_permute_cu_seqlens[dst_expert_idx] + preceding;
+            }
+        } else if (not kDoExpand and ptx::elect_one_sync()) {
             dst_tensor_idx = i;
         } else if (kDoExpand and kCachedMode and lane_idx < kNumTopk) {
             // Cached expand mode: read pre-computed dst_tensor_idx from metadata
@@ -135,7 +144,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
 
         // Issue TMA stores for data
-        if (kDoExpand ? (dst_tensor_idx >= 0) : ptx::elect_one_sync()) {
+        if ((kDoExpand or kDoDirectPermute) ? (dst_tensor_idx >= 0) : ptx::elect_one_sync()) {
             ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
                               tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
             ptx::tma_store_commit();
@@ -162,7 +171,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             const auto recv_sf_hidden_stride_i64 = static_cast<int64_t>(recv_sf_hidden_stride);
 
             // Iterate through all valid indices and store into output buffer
-            auto mask = kDoExpand ? ptx::gather(dst_tensor_idx >= 0) : 1;
+            auto mask = (kDoExpand or kDoDirectPermute) ? ptx::gather(dst_tensor_idx >= 0) : 1;
             while (mask) {
                 const int valid_lane_idx = __ffs(mask) - 1;
                 const auto gmem_dst = math::advance_ptr<sf_pack_t>(recv_sf,
@@ -228,7 +237,34 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
     }
 
-    // Zero padding: clear the alignment gaps between experts in the expanded output
+    // Direct-permute padding is described by the caller's cu_seqlens, not by
+    // DeepEP's expand counters. Clear only those short alignment gaps with
+    // ordinary vector stores. This also avoids the Hopper-only st.bulk helper
+    // on Blackwell; zeroing the whole capacity would waste bandwidth on the
+    // much larger device-valid tail.
+    if constexpr (kDoDirectPermute) {
+        EP_STATIC_ASSERT(kNumSFPacks == 0, "Direct permute currently supports BF16 only");
+        EP_STATIC_ASSERT(kNumHiddenBytes % sizeof(int4) == 0, "Direct permute requires 16-byte hidden alignment");
+        constexpr int kNumHiddenInt4 = kNumHiddenBytes / sizeof(int4);
+        const auto num_global_warps = kNumSMs * kNumWarps;
+        for (int expert_idx = 0; expert_idx < kNumExpertsPerRank; ++ expert_idx) {
+            const int expert_start = direct_permute_cu_seqlens[expert_idx];
+            const int expert_end = direct_permute_cu_seqlens[expert_idx + 1];
+            const int valid_rows = num_recv_tokens == 0 ? 0 :
+                direct_permute_cumulated_multihot[
+                    static_cast<int64_t>(num_recv_tokens - 1) * kNumExpertsPerRank + expert_idx];
+            for (int row = expert_start + valid_rows + global_warp_idx;
+                 row < expert_end; row += num_global_warps) {
+                auto row_ptr = reinterpret_cast<int4*>(
+                    math::advance_ptr(recv_x, static_cast<int64_t>(row) * kNumHiddenBytes));
+                for (int col = lane_idx; col < kNumHiddenInt4; col += 32)
+                    row_ptr[col] = make_int4(0, 0, 0, 0);
+            }
+        }
+    }
+
+    // Zero padding: clear the alignment gaps between experts in the native
+    // expanded output.
     if constexpr (kDoZeroPadding and kDoExpand) {
         // Wait for last TMA store from main loop to complete
         ptx::tma_store_wait();

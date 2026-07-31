@@ -20,6 +20,7 @@ template <bool kIsScaleupNVLink,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          bool kSkipPrologueBarrier,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           bool kUseRankLayout = use_rank_layout<kAllowMultipleReduction, kNumRanks, kNumTopk>(),
@@ -75,9 +76,12 @@ combine_impl(nv_bfloat16* x,
 
     // Full barrier to ensure the remote buffer is available
     const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
-        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    if constexpr (not kSkipPrologueBarrier) {
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
+                          comm::kCombineTag0, false, false, true>(
+            gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    }
 
     // Do TMA writes into the remote buffers
     int num_tokens_per_warp = math::ceil_div(num_reduced_tokens, kNumSMs * kNumWarps);

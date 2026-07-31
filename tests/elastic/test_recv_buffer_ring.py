@@ -67,7 +67,10 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hidden=hidden,
         num_topk=num_topk,
         use_fp8_dispatch=False,
-        allow_hybrid_mode=False,
+        # This machine exposes a multi-plane GIN topology, whose direct mode
+        # is unavailable even for a two-local-rank focused test. Exercise the
+        # production hybrid path used by the training launcher.
+        allow_hybrid_mode=True,
         explicitly_destroy=True,
     )
     buffer.set_dispatch_recv_buffer_reuse(2)
@@ -154,7 +157,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "strides": tuple(t.stride() for t in tensors),
         }
 
-    def make_synced_handle(payload, routing):
+    def make_synced_handle(payload, routing, expert_alignment=1):
         reference, reference_src_idx = reference_for(payload, routing)
         recv_x, _, _, handle, _ = buffer.dispatch(
             x=payload,
@@ -162,7 +165,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_weights=topk_weights,
             num_max_tokens_per_rank=num_tokens,
             num_experts=num_experts,
-            expert_alignment=1,
+            expert_alignment=expert_alignment,
             do_cpu_sync=True,
         )
         _check_dispatch(recv_x, handle, reference, reference_src_idx)
@@ -308,6 +311,55 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _assert_payload_equal(bf16_slot0["snapshot"], bf16_slot0["expected"])
     _assert_payload_equal(cached_small["snapshot"], cached_small["expected"])
     _assert_payload_equal(caller_snapshot, caller_expected)
+
+    # Cached BF16 dispatch can bypass its receive-order intermediate and write
+    # directly into the expert-major layout consumed by grouped GEMM. Build
+    # the same prefix metadata as MMQ's forward permute and compare against a
+    # normal cached dispatch followed by a small torch reference scatter.
+    direct_input = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") + 36
+    _, _, _, direct_handle, _ = buffer.dispatch(
+        x=direct_input,
+        topk_idx=large_topk_idx,
+        topk_weights=topk_weights,
+        num_max_tokens_per_rank=num_tokens,
+        num_experts=num_experts,
+        expert_alignment=8,
+        do_cpu_sync=True,
+    )
+    normal_recv, normal_topk, _, _, _ = buffer.dispatch(
+        x=direct_input, handle=direct_handle, num_sms=direct_handle.num_sms
+    )
+    num_local_experts = num_experts // world_size
+    multihot = torch.zeros(
+        (normal_recv.shape[0], num_local_experts), dtype=torch.int32, device="cuda"
+    )
+    recv_rows = torch.arange(normal_recv.shape[0], device="cuda")
+    for topk_lane_idx in range(num_topk):
+        valid = normal_topk[:, topk_lane_idx] >= 0
+        multihot[
+            recv_rows[valid],
+            normal_topk[valid, topk_lane_idx].long(),
+        ] += 1
+    cumulated_multihot = torch.cumsum(multihot, dim=0, dtype=torch.int32)
+    counts = cumulated_multihot[-1]
+    direct_cu_seqlens = torch.zeros(num_local_experts + 1, dtype=torch.int32, device="cuda")
+    direct_cu_seqlens[1:] = torch.cumsum((counts + 7) // 8 * 8, dim=0)
+    output_rows = int(direct_cu_seqlens[-1].item())
+    expected_direct = torch.zeros((output_rows, hidden), dtype=normal_recv.dtype, device="cuda")
+    for expert_idx in range(num_local_experts):
+        src_rows = torch.where(normal_topk == expert_idx)[0]
+        dst_start = int(direct_cu_seqlens[expert_idx].item())
+        expected_direct[dst_start:dst_start + src_rows.numel()] = normal_recv[src_rows]
+
+    direct_recv, _, _, _, _ = buffer.dispatch(
+        x=direct_input,
+        handle=direct_handle,
+        num_sms=direct_handle.num_sms,
+        direct_permute_cumulated_multihot=cumulated_multihot,
+        direct_permute_cu_seqlens=direct_cu_seqlens,
+        direct_permute_output_rows=output_rows,
+    )
+    assert torch.equal(direct_recv, expected_direct)
 
     # Explicit release keeps slot IDs configured; setting zero additionally
     # disables the policy. Both operations synchronize before freeing storage.

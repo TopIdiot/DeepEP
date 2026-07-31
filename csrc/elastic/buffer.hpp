@@ -801,7 +801,7 @@ public:
                torch::Tensor, torch::Tensor, torch::Tensor,
                torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<EventHandle>>
+               std::optional<EventHandle>, std::optional<EventHandle>>
     dispatch(const torch::Tensor& x,
              const std::optional<torch::Tensor>& sf,
              const torch::Tensor& topk_idx,
@@ -829,7 +829,11 @@ public:
              const bool& use_tma_aligned_col_major_sf,
              const std::optional<int>& dispatch_recv_buffer_slot,
              const bool& caller_managed_dispatch_recv_lifetime,
-             const bool& caller_managed_dispatch_recv_compute_owner) {
+             const bool& caller_managed_dispatch_recv_compute_owner,
+             const bool& return_input_consumed_event,
+             const std::optional<torch::Tensor>& direct_permute_cumulated_multihot,
+             const std::optional<torch::Tensor>& direct_permute_cu_seqlens,
+             const std::optional<int>& direct_permute_output_rows) {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -903,6 +907,27 @@ public:
         }
 
         const bool reuse_dispatch_recv_buffer = dispatch_recv_buffer_slot.has_value();
+        const bool do_direct_permute = direct_permute_cumulated_multihot.has_value();
+        EP_HOST_ASSERT(do_direct_permute == direct_permute_cu_seqlens.has_value() and
+                       do_direct_permute == direct_permute_output_rows.has_value() and
+                       "Direct permute requires both metadata tensors and output rows");
+        if (do_direct_permute) {
+            const auto [direct_num_tokens, direct_num_local_experts] =
+                get_shape<2>(direct_permute_cumulated_multihot.value());
+            const auto [direct_num_cu_seqlens] = get_shape<1>(direct_permute_cu_seqlens.value());
+            EP_HOST_ASSERT(cached_mode and not do_expand and not sf.has_value() and
+                           "Direct permute requires cached BF16 non-expanded dispatch");
+            EP_HOST_ASSERT(direct_num_tokens >= cached_num_recv_tokens.value() and
+                           direct_num_local_experts == num_local_experts and
+                           direct_num_cu_seqlens == num_local_experts + 1);
+            EP_HOST_ASSERT(direct_permute_cumulated_multihot->is_cuda() and
+                           direct_permute_cumulated_multihot->is_contiguous() and
+                           direct_permute_cumulated_multihot->scalar_type() == torch::kInt);
+            EP_HOST_ASSERT(direct_permute_cu_seqlens->is_cuda() and
+                           direct_permute_cu_seqlens->is_contiguous() and
+                           direct_permute_cu_seqlens->scalar_type() == torch::kInt);
+            EP_HOST_ASSERT(direct_permute_output_rows.value() > 0);
+        }
         EP_HOST_ASSERT(not (reuse_dispatch_recv_buffer and caller_managed_dispatch_recv_lifetime) and
                        "Reusable and caller-managed dispatch receive lifetimes are mutually exclusive");
         EP_HOST_ASSERT((not caller_managed_dispatch_recv_lifetime or
@@ -921,6 +946,9 @@ public:
             EP_HOST_ASSERT((not async_with_compute_stream or allocate_on_comm_stream) and
                            "Reusable asynchronous dispatch receive storage must be allocated on the communication stream");
         }
+        EP_HOST_ASSERT(not (do_direct_permute and
+                            (reuse_dispatch_recv_buffer or caller_managed_dispatch_recv_lifetime)) and
+                       "Direct permute owns its expert-major receive allocation");
 
         // Stream control
         // All new tensor allocations should happen after this. Keep argument
@@ -1130,6 +1158,14 @@ public:
                         cached_mode, do_cpu_sync,
                         comm_stream);
 
+        // The persistent communication body is the final reader of x/sf.
+        // Output allocation and the copy epilogue below do not access them, so
+        // a fixed input ring can safely reuse its slot behind this narrower
+        // fence instead of waiting for the whole dispatch operation.
+        auto input_consumed_event = std::optional<EventHandle>();
+        if (return_input_consumed_event)
+            input_consumed_event = EventHandle(comm_stream);
+
         // Received token counters
         int num_recv_tokens = 0, num_expanded_tokens = 0;
         int counter_scaleup_rank_idx = 0, counter_local_expert_idx = 0;
@@ -1200,7 +1236,8 @@ public:
 
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
-        const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
+        const auto num_allocated_tokens = do_direct_permute ? direct_permute_output_rows.value() :
+            (do_expand ? num_expanded_tokens : num_recv_tokens);
         // Cached dispatch reports the exact receive size from its forward
         // handle.  A slot shared by many layers would otherwise grow every
         // time it sees a larger handle, releasing the old storage before the
@@ -1303,7 +1340,8 @@ public:
             at::cuda::setCurrentCUDAStream(comm_stream);
         }
         if (not do_expand) {
-            recv_topk_idx = torch::empty({num_allocated_tokens, num_topk}, topk_idx.options());
+            recv_topk_idx = torch::empty({do_direct_permute ? num_recv_tokens : num_allocated_tokens, num_topk},
+                                         topk_idx.options());
             recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
         }
         if (topk_weights.has_value()) {
@@ -1338,6 +1376,8 @@ public:
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
                                       num_unaligned_recv_tokens_per_expert_ptr,
+                                      do_direct_permute ? direct_permute_cumulated_multihot->data_ptr<int>() : nullptr,
+                                      do_direct_permute ? direct_permute_cu_seqlens->data_ptr<int>() : nullptr,
                                       num_recv_tokens, num_max_tokens_per_rank,
                                       num_hidden_bytes,
                                       num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
@@ -1349,6 +1389,7 @@ public:
                                       num_channels,
                                       do_expand, cached_mode,
                                       do_zero_padding,
+                                      do_direct_permute,
                                       comm_stream);
 
         // Stream control
@@ -1371,7 +1412,9 @@ public:
              recv_src_metadata,
              dst_buffer_slot_idx,
              token_metadata_at_forward,
-             channel_linked_list},
+             channel_linked_list,
+             direct_permute_cumulated_multihot,
+             direct_permute_cu_seqlens},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
@@ -1387,10 +1430,12 @@ public:
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
                 channel_linked_list,
-                event};
+                event,
+                input_consumed_event};
     }
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<EventHandle>, std::optional<EventHandle>>
     combine(const torch::Tensor& x,
             const std::optional<torch::Tensor>& topk_weights,
             const std::optional<torch::Tensor>& bias_0,
@@ -1407,7 +1452,10 @@ public:
             const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& use_expanded_layout) const {
+            const bool& use_expanded_layout,
+            const bool& return_input_consumed_event,
+            const bool& caller_managed_combine_input_lifetime,
+            const bool& caller_managed_combine_output_compute_owner) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1516,6 +1564,23 @@ public:
             use_expanded_layout, allow_multiple_reduction,
             comm_stream);
 
+        // launch_combine is the final reader of x/topk_weights. The reduce
+        // epilogue only consumes the communication buffer and dispatch handle.
+        auto input_consumed_event = std::optional<EventHandle>();
+        if (return_input_consumed_event)
+            input_consumed_event = EventHandle(comm_stream);
+
+        // Combine outputs are consumed only on the compute stream. In
+        // caller-managed mode, allocate them there and publish the allocation
+        // tail to the communication stream immediately before its epilogue
+        // writes them. This mirrors fresh dispatch recv_x ownership in the
+        // opposite direction and avoids allocator-pending output frees.
+        const bool combine_output_compute_owned =
+            caller_managed_combine_output_compute_owner and
+            async_with_compute_stream and allocate_on_comm_stream;
+        if (combine_output_compute_owned)
+            at::cuda::setCurrentCUDAStream(compute_stream);
+
         // Allocate output tensors
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
         auto combined_topk_weights = std::optional<torch::Tensor>();
@@ -1524,9 +1589,16 @@ public:
             combined_topk_weights = torch::empty({num_combined_tokens, num_topk}, topk_weights->options());
             combined_topk_weights_ptr = combined_topk_weights->data_ptr<float>();
         }
+        auto combine_output_allocation_ready = std::optional<EventHandle>();
+        if (combine_output_compute_owned) {
+            combine_output_allocation_ready = EventHandle(compute_stream);
+            at::cuda::setCurrentCUDAStream(comm_stream);
+        }
 
         // Combine pushed data
         stream_control_before_epilogue(previous_event_before_epilogue);
+        if (combine_output_allocation_ready.has_value())
+            stream_wait(comm_stream, combine_output_allocation_ready.value());
         launch_combine_reduce_epilogue(combined_x.data_ptr(),
                                        combined_topk_weights_ptr,
                                        combined_topk_idx.data_ptr<topk_idx_t>(),
@@ -1544,16 +1616,23 @@ public:
 
         // Stream control
         const auto event = stream_control_epilogue(
-            {x, topk_weights, bias_0, bias_1,
+            {caller_managed_combine_input_lifetime
+                 ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(x),
+             caller_managed_combine_input_lifetime
+                 ? std::optional<torch::Tensor>() : topk_weights,
+             bias_0, bias_1,
              src_metadata,
              combined_topk_idx,
-             combined_x, combined_topk_weights,
+             combine_output_compute_owned
+                 ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(combined_x),
+             combine_output_compute_owned
+                 ? std::optional<torch::Tensor>() : combined_topk_weights,
              psum_num_recv_tokens_per_scaleup_rank,
              token_metadata_at_forward,
              channel_linked_list},
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
-        return {combined_x, combined_topk_weights, event};
+        return {combined_x, combined_topk_weights, event, input_consumed_event};
     }
 };
 

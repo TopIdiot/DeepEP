@@ -943,7 +943,11 @@ class ElasticBuffer:
                  use_tma_aligned_col_major_sf: bool = False,
                  dispatch_recv_buffer_slot: Optional[int] = None,
                  caller_managed_dispatch_recv_lifetime: bool = False,
-                 caller_managed_dispatch_recv_compute_owner: bool = False) \
+                 caller_managed_dispatch_recv_compute_owner: bool = False,
+                 return_input_consumed_event: bool = False,
+                 direct_permute_cumulated_multihot: Optional[torch.Tensor] = None,
+                 direct_permute_cu_seqlens: Optional[torch.Tensor] = None,
+                 direct_permute_output_rows: Optional[int] = None) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -1008,6 +1012,18 @@ class ElasticBuffer:
                 final compute-stream reader allocator-safe without
                 ``record_stream``. Requires caller-managed lifetime,
                 asynchronous execution, and ``allocate_on_comm_stream=True``.
+            return_input_consumed_event: also return an event recorded after
+                the persistent communication body has finished reading ``x``
+                (and its optional scale) but before the output copy epilogue.
+                This is intended for precise fixed-input-slot retirement.
+            direct_permute_cumulated_multihot: optional int32 device prefix
+                counts from the caller's forward permute. Cached BF16 dispatch
+                uses this together with ``direct_permute_cu_seqlens`` to write
+                the receive payload directly into expert-major order.
+            direct_permute_cu_seqlens: optional int32 device expert segment
+                boundaries for direct expert-major output.
+            direct_permute_output_rows: capacity row count of the direct
+                expert-major output. Required with the two metadata tensors.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
@@ -1077,6 +1093,16 @@ class ElasticBuffer:
                 raise ValueError(
                     "Compute-owned dispatch receive storage requires asynchronous communication-stream dispatch"
                 )
+        direct_permute = direct_permute_cumulated_multihot is not None
+        if direct_permute != (direct_permute_cu_seqlens is not None):
+            raise ValueError("direct permute requires both cumulated_multihot and cu_seqlens")
+        if direct_permute != (direct_permute_output_rows is not None):
+            raise ValueError("direct permute requires an explicit output row capacity")
+        if direct_permute:
+            if handle is None or sf is not None or do_expand:
+                raise ValueError("direct permute requires cached BF16 non-expanded dispatch")
+            if dispatch_recv_buffer_slot is not None or caller_managed_dispatch_recv_lifetime:
+                raise ValueError("direct permute owns its expert-major receive allocation")
 
         # Do dispatch
         (recv_x, recv_sf,
@@ -1091,7 +1117,7 @@ class ElasticBuffer:
          dst_buffer_slot_idx,
          token_metadata_at_forward,
          channel_linked_list,
-         event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
+         event, input_consumed_event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
                                         cumulative_local_expert_recv_stats,
                                         cached_num_recv_tokens,
                                         cached_num_expanded_tokens,
@@ -1114,7 +1140,11 @@ class ElasticBuffer:
                                         use_tma_aligned_col_major_sf,
                                         dispatch_recv_buffer_slot,
                                         caller_managed_dispatch_recv_lifetime,
-                                        caller_managed_dispatch_recv_compute_owner)
+                                        caller_managed_dispatch_recv_compute_owner,
+                                        return_input_consumed_event,
+                                        direct_permute_cumulated_multihot,
+                                        direct_permute_cu_seqlens,
+                                        direct_permute_output_rows)
 
         # Create handle
         is_cached_dispatch = handle is not None
@@ -1151,7 +1181,10 @@ class ElasticBuffer:
         recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
 
         # Return
-        return recv_x, recv_topk_idx, recv_topk_weights, handle, event_overlap
+        result = (recv_x, recv_topk_idx, recv_topk_weights, handle, event_overlap)
+        if return_input_consumed_event:
+            return (*result, EventOverlap(input_consumed_event))
+        return result
 
     @staticmethod
     def _unpack_bias(bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) \
@@ -1173,7 +1206,10 @@ class ElasticBuffer:
                 previous_event: EventHandle = None,
                 previous_event_before_epilogue: Optional[EventHandle] = None,
                 async_with_compute_stream: bool = False,
-                allocate_on_comm_stream: bool = False) \
+                allocate_on_comm_stream: bool = False,
+                return_input_consumed_event: bool = False,
+                caller_managed_combine_input_lifetime: bool = False,
+                caller_managed_combine_output_compute_owner: bool = False) \
             -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Combine (reduce) tokens from different ranks back to their original ranks.
@@ -1195,6 +1231,17 @@ class ElasticBuffer:
                 finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the
                 communication stream.
+            return_input_consumed_event: also return an event recorded after
+                the persistent communication body has finished reading ``x``
+                and ``topk_weights`` but before the reduce epilogue.
+            caller_managed_combine_input_lifetime: omit ``x`` and
+                ``topk_weights`` from DeepEP's allocator stream recording. The
+                caller must retain them until the returned completion event is
+                waited on their allocation stream.
+            caller_managed_combine_output_compute_owner: allocate fresh combine
+                outputs on the compute stream and order the communication
+                epilogue after their allocation-ready event. The caller owns
+                the outputs' final-reader lifetime on that stream.
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
@@ -1209,7 +1256,7 @@ class ElasticBuffer:
         assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
 
         bias_0, bias_1 = ElasticBuffer._unpack_bias(bias)
-        combined_x, combined_topk_weights, event = \
+        combined_x, combined_topk_weights, event, input_consumed_event = \
             self.runtime.combine(x, topk_weights,
                                  bias_0, bias_1,
                                  handle.recv_src_metadata,
@@ -1224,5 +1271,11 @@ class ElasticBuffer:
                                  previous_event_before_epilogue,
                                  async_with_compute_stream,
                                  allocate_on_comm_stream,
-                                 handle.do_expand)
-        return combined_x, combined_topk_weights, EventOverlap(event)
+                                 handle.do_expand,
+                                 return_input_consumed_event,
+                                 caller_managed_combine_input_lifetime,
+                                 caller_managed_combine_output_compute_owner)
+        result = (combined_x, combined_topk_weights, EventOverlap(event))
+        if return_input_consumed_event:
+            return (*result, EventOverlap(input_consumed_event))
+        return result

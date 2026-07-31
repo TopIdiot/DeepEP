@@ -8,6 +8,7 @@
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+#include "direct_prologue_barrier.hpp"
 
 namespace deep_ep::elastic {
 
@@ -18,6 +19,7 @@ public:
         bool is_scaleup_nvlink;
         bool do_cpu_sync;
         bool reuse_slot_indices;
+        bool skip_prologue_barrier;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
@@ -52,7 +54,7 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "dispatch";
-            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.is_scaleup_nvlink,
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
@@ -62,7 +64,8 @@ public:
                 args.num_hidden_bytes, args.num_sf_packs,
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
-                args.num_qps, args.num_timeout_cycles);
+                args.num_qps, args.num_timeout_cycles,
+                args.skip_prologue_barrier);
         } else {
             header_name = "hybrid_dispatch";
             func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -196,10 +199,13 @@ static void launch_dispatch(void* x, void* sf,
     }
 
     // Generate, build and launch
+    const bool split_prologue_barrier =
+        num_scaleout_ranks == 1 and get_env<int>("EP_SPLIT_DIRECT_PROLOGUE_BARRIER", 0) != 0;
     const DispatchRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync = do_cpu_sync,
         .reuse_slot_indices = reuse_slot_indices,
+        .skip_prologue_barrier = split_prologue_barrier,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
@@ -224,6 +230,13 @@ static void launch_dispatch(void* x, void* sf,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
+    if (split_prologue_barrier) {
+        launch_direct_prologue_barrier(
+            nccl_dev_comm, nccl_window, workspace,
+            scaleup_rank_idx, num_scaleup_ranks,
+            num_qps, num_timeout_cycles, is_scaleup_nvlink,
+            DirectPrologueBarrierKind::kDispatch, stream);
+    }
     const auto code = DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch", code);
     DispatchRuntime::launch(runtime, args, stream);
@@ -233,7 +246,7 @@ class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopy
 public:
     struct Args {
         // Templated arguments
-        bool do_expand, cached_mode, do_zero_padding;
+        bool do_expand, cached_mode, do_zero_padding, do_direct_permute;
         int num_channels;
         int num_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
@@ -250,6 +263,8 @@ public:
         int* recv_src_metadata;
         int* channel_linked_list;
         int* num_unaligned_recv_tokens_per_expert;
+        const int* direct_permute_cumulated_multihot;
+        const int* direct_permute_cu_seqlens;
         int num_recv_tokens;
         int recv_sf_token_stride, recv_sf_hidden_stride;
         int scaleout_rank_idx, scaleup_rank_idx;
@@ -264,10 +279,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
-                           args.do_expand, args.cached_mode, args.do_zero_padding,
+                           args.do_expand, args.cached_mode, args.do_zero_padding, args.do_direct_permute,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
@@ -284,6 +299,8 @@ static void __instantiate_kernel() {{
                                                  args.recv_src_metadata,
                                                  args.channel_linked_list,
                                                  args.num_unaligned_recv_tokens_per_expert,
+                                                 args.direct_permute_cumulated_multihot,
+                                                 args.direct_permute_cu_seqlens,
                                                  args.num_recv_tokens,
                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
                                                  args.scaleout_rank_idx, args.scaleup_rank_idx));
@@ -298,6 +315,8 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           int* recv_src_metadata,
                                           int* channel_linked_list,
                                           int* num_unaligned_recv_tokens_per_expert,
+                                          const int* direct_permute_cumulated_multihot,
+                                          const int* direct_permute_cu_seqlens,
                                           const int& num_recv_tokens, const int& num_max_tokens_per_rank,
                                           const int& num_hidden_bytes,
                                           const int& num_sf_packs, const int& recv_sf_token_stride, const int& recv_sf_hidden_stride,
@@ -307,7 +326,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_sms, const int& num_smem_bytes,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
-                                          const bool& do_zero_padding,
+                                          const bool& do_zero_padding, const bool& do_direct_permute,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -317,6 +336,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
         .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding,
+        .do_direct_permute = do_direct_permute,
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,
@@ -330,6 +350,8 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .recv_src_metadata = recv_src_metadata,
         .channel_linked_list = channel_linked_list,
         .num_unaligned_recv_tokens_per_expert = num_unaligned_recv_tokens_per_expert,
+        .direct_permute_cumulated_multihot = direct_permute_cumulated_multihot,
+        .direct_permute_cu_seqlens = direct_permute_cu_seqlens,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
