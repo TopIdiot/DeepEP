@@ -549,22 +549,37 @@ public:
         return compute_stream;
     }
 
-    std::optional<EventHandle> stream_control_epilogue(const std::vector<std::optional<torch::Tensor>>& tensors,
-                                                       const at::cuda::CUDAStream& compute_stream,
-                                                       const bool& allocate_on_comm_stream,
-                                                       const bool& async_with_compute_stream) const {
+    std::optional<EventHandle> stream_control_epilogue(
+            const std::vector<std::optional<torch::Tensor>>& lifetime_tensors,
+            const std::vector<std::optional<torch::Tensor>>& consumer_tensors,
+            const bool& defer_allocator_recording,
+            const at::cuda::CUDAStream& compute_stream,
+            const bool& allocate_on_comm_stream,
+            const bool& async_with_compute_stream) const {
         // Ensure memory access safety between two streams
         std::optional<EventHandle> event;
         if (async_with_compute_stream) {
             event = EventHandle(comm_stream);
 
-            // NOTES: this environment only applies to V2 APIs
-            if (get_env<int>("EP_AVOID_RECORD_STREAM", 0)) {
-                event->tensors_to_record = tensors;
+            if (defer_allocator_recording) {
+                // Retain everything through communication completion, but
+                // publish only comm-owned tensors that can be read by the
+                // stream which actually waits.  This preserves allocator
+                // safety without the old two-records-per-tensor epilogue.
+                for (const auto& tensor: lifetime_tensors) {
+                    if (tensor.has_value() and tensor->defined())
+                        event->tensors_to_retain.emplace_back(*tensor);
+                }
+                for (const auto& tensor: consumer_tensors) {
+                    if (tensor.has_value() and tensor->defined() and tensor->is_cuda())
+                        event->storages_to_record.emplace_back(tensor->storage());
+                }
             } else {
-                for (auto& t: tensors) if (t.has_value()) {
-                    t->record_stream(compute_stream);
-                    t->record_stream(comm_stream);
+                for (const auto& tensor: lifetime_tensors) {
+                    if (tensor.has_value() and tensor->defined() and tensor->is_cuda()) {
+                        tensor->record_stream(compute_stream);
+                        tensor->record_stream(comm_stream);
+                    }
                 }
             }
         } else {
@@ -798,9 +813,8 @@ public:
                         not async_with_compute_stream or allocate_on_comm_stream) and
                        "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream");
         EP_HOST_ASSERT((not caller_managed_dispatch_recv_compute_owner or
-                        (caller_managed_dispatch_recv_lifetime and async_with_compute_stream and
-                         allocate_on_comm_stream)) and
-                       "Compute-owned dispatch receive storage requires fresh caller-managed asynchronous dispatch");
+                        caller_managed_dispatch_recv_lifetime) and
+                       "Compute-owned dispatch receive storage requires caller-managed lifetime");
         // Stream control
         // All new tensor allocations should happen after this. Keep argument
         // validation above so a rejected call cannot leave the current stream
@@ -1080,17 +1094,20 @@ public:
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
-        auto recv_x = torch::Tensor();
-        auto recv_sf = std::optional<torch::Tensor>();
-        if (caller_managed_dispatch_recv_compute_owner)
-            at::cuda::setCurrentCUDAStream(compute_stream);
-        recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
-        auto recv_topk_idx = std::optional<torch::Tensor>();
-        auto recv_topk_weights = std::optional<torch::Tensor>();
         auto recv_src_metadata = cached_mode ?
             cached_recv_src_metadata.value() :
             torch::empty({num_recv_tokens, num_topk + 2},
                          torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+        auto recv_x = torch::Tensor();
+        auto recv_sf = std::optional<torch::Tensor>();
+        const bool dispatch_recv_compute_owned =
+            caller_managed_dispatch_recv_compute_owner and
+            async_with_compute_stream and allocate_on_comm_stream;
+        if (dispatch_recv_compute_owned)
+            at::cuda::setCurrentCUDAStream(compute_stream);
+        recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+        auto recv_topk_idx = std::optional<torch::Tensor>();
+        auto recv_topk_weights = std::optional<torch::Tensor>();
 
         // Optional tensors
         void* recv_sf_ptr = nullptr;
@@ -1109,7 +1126,7 @@ public:
             recv_sf_ptr = recv_sf->data_ptr();
         }
         auto dispatch_recv_allocation_ready = std::optional<EventHandle>();
-        if (caller_managed_dispatch_recv_compute_owner) {
+        if (dispatch_recv_compute_owned) {
             // The caching allocator may return storage whose previous reader
             // is still queued on the compute stream.  Keep all other dispatch
             // allocations communication-stream owned, but order the copy
@@ -1191,6 +1208,24 @@ public:
              dst_buffer_slot_idx,
              token_metadata_at_forward,
              channel_linked_list},
+            {// Communication-owned outputs and handle state can be consumed
+             // after the wait on the caller's compute stream.  Caller-managed
+             // recv storage is compute-owned and therefore needs no record.
+             caller_managed_dispatch_recv_lifetime
+                 ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(recv_x),
+             caller_managed_dispatch_recv_lifetime
+                 ? std::optional<torch::Tensor>() : recv_sf,
+             recv_topk_idx, recv_topk_weights,
+             copied_topk_idx,
+             psum_num_recv_tokens_per_scaleup_rank,
+             psum_num_recv_tokens_per_expert,
+             num_unaligned_recv_tokens_per_expert,
+             recv_src_metadata,
+             dst_buffer_slot_idx,
+             token_metadata_at_forward,
+             channel_linked_list},
+            caller_managed_dispatch_input_lifetime or
+                caller_managed_dispatch_recv_lifetime,
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
@@ -1396,6 +1431,15 @@ public:
              psum_num_recv_tokens_per_scaleup_rank,
              token_metadata_at_forward,
              channel_linked_list},
+            {// In split-owner mode these outputs already belong to compute.
+             // Otherwise they are the only combine allocations returned for
+             // later compute consumption; the rest are retained inputs.
+             combine_output_compute_owned
+                 ? std::optional<torch::Tensor>() : std::optional<torch::Tensor>(combined_x),
+             combine_output_compute_owned
+                 ? std::optional<torch::Tensor>() : combined_topk_weights},
+            caller_managed_combine_input_lifetime or
+                caller_managed_combine_output_compute_owner,
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
         return {combined_x, combined_topk_weights, event};

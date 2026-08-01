@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <memory>
 
 #include <deep_ep/common/exception.cuh>
@@ -9,7 +10,14 @@ namespace deep_ep {
 
 struct EventHandle {
     std::shared_ptr<torch::Event> event;
-    std::vector<std::optional<torch::Tensor>> tensors_to_record;
+    // Keep communication inputs and temporaries alive through the producer
+    // event.  Retention alone is sufficient for tensors allocated on the
+    // compute stream: the wait orders their eventual release after comm.
+    std::vector<torch::Tensor> tensors_to_retain;
+    // Stable storage aliases for communication-owned tensors that may have
+    // later compute-stream readers. Keeping Storage instead of Tensor makes
+    // the allocator publication immune to callers rebinding ``tensor.data``.
+    std::vector<c10::Storage> storages_to_record;
 
     EventHandle() {
         event = std::make_shared<torch::Event>(torch::kCUDA);
@@ -23,7 +31,17 @@ struct EventHandle {
 
     EventHandle(const EventHandle& other) = default;
 
-    void current_stream_wait() const { at::cuda::getCurrentCUDAStream().unwrap().wait(*event); }
+    void wait_and_publish(const at::cuda::CUDAStream& stream) const {
+        stream.unwrap().wait(*event);
+        for (const auto& storage: storages_to_record)
+            c10::cuda::CUDACachingAllocator::recordStream(storage.data_ptr(), stream);
+    }
+
+    // Compatibility entry point for Python callers. This is an action, not an
+    // observation: it both waits and publishes the actual allocator consumer.
+    void current_stream_wait() const {
+        wait_and_publish(at::cuda::getCurrentCUDAStream());
+    }
 };
 
 static torch::Event create_event(const at::cuda::CUDAStream& s) {
@@ -38,7 +56,7 @@ static void stream_wait(const at::cuda::CUDAStream& s_0, const at::cuda::CUDAStr
 }
 
 static void stream_wait(const at::cuda::CUDAStream& s, const EventHandle& event) {
-    s.unwrap().wait(*event.event);
+    event.wait_and_publish(s);
 }
 
 }  // namespace deep_ep

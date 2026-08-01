@@ -930,8 +930,10 @@ class ElasticBuffer:
                 DeepEP records an allocation-ready event and waits for it only
                 before the copy epilogue writes those tensors. This makes the
                 final compute-stream reader allocator-safe without
-                ``record_stream``. Requires caller-managed lifetime,
-                asynchronous execution, and ``allocate_on_comm_stream=True``.
+                ``record_stream``. Requires caller-managed lifetime. The
+                explicit split-owner path is enabled only for asynchronous
+                communication-stream dispatch; synchronous calls safely fall
+                back to their normal allocation stream.
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
             recv_topk_idx: received expert indices
@@ -977,18 +979,22 @@ class ElasticBuffer:
         num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
-        if caller_managed_dispatch_recv_lifetime:
-            if async_with_compute_stream and not allocate_on_comm_stream:
-                raise ValueError(
-                    "Caller-managed asynchronous dispatch receive storage must be allocated on the communication stream"
-                )
-        if caller_managed_dispatch_recv_compute_owner:
-            if not caller_managed_dispatch_recv_lifetime:
-                raise ValueError("Compute-owned dispatch receive storage requires caller-managed lifetime")
-            if not async_with_compute_stream or not allocate_on_comm_stream:
-                raise ValueError(
-                    "Compute-owned dispatch receive storage requires asynchronous communication-stream dispatch"
-                )
+        if (
+            caller_managed_dispatch_recv_lifetime
+            and async_with_compute_stream
+            and not allocate_on_comm_stream
+        ):
+            raise ValueError(
+                "Caller-managed asynchronous dispatch receive storage must be "
+                "allocated on the communication stream"
+            )
+        if (
+            caller_managed_dispatch_recv_compute_owner
+            and not caller_managed_dispatch_recv_lifetime
+        ):
+            raise ValueError(
+                "Compute-owned dispatch receive storage requires caller-managed lifetime"
+            )
         # Do dispatch
         (recv_x, recv_sf,
          recv_topk_idx, recv_topk_weights,

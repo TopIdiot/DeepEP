@@ -47,8 +47,9 @@ class EventOverlap:
             self.hook_after_wait()
             self.hook_after_wait = None
 
-        # In `self.event`, we also have some V2 APIs storing tensors to record in it,
-        # So, after waiting the current stream, those tensors can be released by deleting `self.event`
+        # V2 events may retain communication tensors and publish the waiting
+        # stream to the allocator here. After that publication, the event's
+        # lifetime-only references may be released by deleting `self.event`.
         # However, you better do it by yourself (to be compatible with multi-stream waits)
         if release_handle:
             self.event = None

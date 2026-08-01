@@ -95,3 +95,7 @@ from .utils.envs import get_physical_domain_size, get_logical_domain_size
 from deep_ep_ring._C import Config, topk_idx_t
 
 __version__ = '2.1.0'
+
+# MMQ-specific feature stamps.  Keep these in the wheel next to the Python API
+# so MMQ can reject an extension that lacks the matching ownership protocol.
+MMQ_CALLER_MANAGED_OWNERSHIP_ABI = 2

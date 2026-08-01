@@ -338,7 +338,6 @@ The library provides some environment variables, which may be useful:
 - General
     - `EP_BUFFER_DEBUG`: `0` or `1`, print buffer initialization, SM approximation, and backend debugging information, `0` by default
     - `EP_SUPPRESS_NCCL_CHECK`: `0` or `1`, suppress NCCL version mismatch checking, `0` by default
-    - `EP_AVOID_RECORD_STREAM`: `0` or `1`, avoid `record_stream` on output tensors, `0` by default
     - `EP_NUM_TOPK_IDX_BITS`: integer, override the number of bits for top-k index encoding, `0` (auto) by default
 - Networking
     - `EP_NIC_NAME`: string, the default NIC name used to query NIC properties, `mlx5_0` by default

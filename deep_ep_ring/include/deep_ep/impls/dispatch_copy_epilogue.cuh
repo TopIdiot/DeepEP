@@ -59,9 +59,23 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
 
+    // Validate the device-only count source once per launch.  A stale value can
+    // still be in range, but a stale prefix array will usually stop being
+    // monotonic.  Restrict the scan to SM0/warp0 to keep it off the copy path.
+    if (global_warp_idx == 0) {
+        for (int rank_idx = lane_idx; rank_idx < kNumScaleupRanks; rank_idx += 32) {
+            const auto current_psum = psum_num_recv_tokens_per_scaleup_rank[rank_idx];
+            const auto previous_psum = rank_idx == 0 ? 0 : psum_num_recv_tokens_per_scaleup_rank[rank_idx - 1];
+            EP_DEVICE_ASSERT(current_psum >= previous_psum and
+                             current_psum <= kNumMaxTokensPerRank * kNumRanks);
+        }
+    }
+
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1];
+    EP_DEVICE_ASSERT(num_recv_tokens >= 0 and
+                     num_recv_tokens <= kNumMaxTokensPerRank * kNumRanks);
 
     // Current rank indices should be maintained
     int current_rank_idx = -1, stored_psum_num_recv_tokens;
