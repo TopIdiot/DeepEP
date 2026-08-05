@@ -37,3 +37,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Register elastic buffer (DeepEP V2) APIs
     deep_ep::elastic::register_apis(m);
 }
+
+// R05C05 defines JIT static data members in headers included by buffer.hpp.
+// Keep the transport ABI in this existing translation unit to avoid duplicate
+// definitions while still exporting a stable C entrypoint from the provider
+// extension (deep_ep._C or deep_ep_ring._C).
+#include "elastic/transport_abi.cpp"
